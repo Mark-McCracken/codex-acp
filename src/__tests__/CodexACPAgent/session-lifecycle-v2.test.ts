@@ -104,6 +104,8 @@ async function connectV2Client(options?: {
     replayTurns?: Thread["turns"];
     /** Makes the given Codex app-server method reject, to simulate a Codex-side failure. */
     failMethod?: {method: string; error: Error};
+    /** Declares the AIR client in `initialize`. */
+    airClient?: boolean;
 }) {
     const mocks = createMockConnections();
     const codexRequests: Array<{method: string, params: unknown}> = [];
@@ -140,6 +142,7 @@ async function connectV2Client(options?: {
     await connection.agent.request(acpV2.methods.agent.initialize, {
         protocolVersion: 2,
         info: {name: "test-client", version: "1.0.0"},
+        ...(options?.airClient ? {capabilities: {_meta: {jetbrains: {air: {version: 1}}}}} : {}),
     });
     return {connection, agent: () => agent!, codexRequests, updates};
 }
@@ -337,6 +340,27 @@ describe('Session lifecycle over ACP v2', () => {
 
         await expect(dump({response, codexRequests, updates: replayedUpdates}))
             .toMatchFileSnapshot('data/session-lifecycle-v2-resume-start-replay.json');
+    });
+
+    it('marks each replayed v2 update for AIR, and only the last one as the end', async () => {
+        const {connection, updates} = await connectV2Client({replayTurns, airClient: true});
+        closeClient = () => connection.close();
+
+        await connection.agent.request(acpV2.methods.agent.session.resume, {
+            sessionId,
+            cwd,
+            replayFrom: {type: "start"},
+        });
+
+        // The command list and the goal go out before the replay, so they carry no mark.
+        const marks = updates.map(({update, _meta}) => [update.sessionUpdate, _meta] as const);
+        const replayed = marks.filter(([, meta]) => meta !== undefined);
+        expect(marks.slice(0, marks.length - replayed.length).every(([, meta]) => meta === undefined)).toBe(true);
+        expect(replayed.map(([, meta]) => meta)).toEqual(replayed.map((_, index) => index === replayed.length - 1
+            ? {loadSessionReplayIndex: index, loadSessionEndOfRecordedHistory: true}
+            : {loadSessionReplayIndex: index}));
+        // The whole-message update that starts a replayed message is a replayed update too.
+        expect(replayed.map(([kind]) => kind)).toContain("user_message");
     });
 
     it('does not replay any history when replayFrom is absent', async () => {

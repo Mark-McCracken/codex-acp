@@ -294,6 +294,14 @@ describe("CodexACPAgent - loadSession", () => {
         expect(orphanTerminalIndex).toBeGreaterThan(secondOutputIndex);
         expect(updates[firstOutputIndex]?.sessionId).toBe("child-history");
         expect(updates[secondOutputIndex]?.sessionId).toBe("child-history:generation:2");
+        // Only the replayed updates of the loaded session carry the replay marks, numbered without a gap.
+        // The orphan disconnect is the last of them.
+        const marked = updates.filter(({_meta}) => _meta !== undefined);
+        expect(marked.every(({sessionId}) => sessionId === root.id)).toBe(true);
+        expect(marked.map(({_meta}) => _meta.loadSessionReplayIndex)).toEqual(marked.map((_, index) => index));
+        expect(marked.filter(({_meta}) => _meta.loadSessionEndOfRecordedHistory === true)).toEqual([marked.at(-1)]);
+        expect(marked.at(-1)!.update).toMatchObject({subagentSessionId: "orphan-history", state: "disconnected"});
+        expect(marked[0]!.update.sessionUpdate).toBe("session_info_update");
     });
 
     it("replays a follow-up turn of a finished child as a new generation", async () => {

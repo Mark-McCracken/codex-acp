@@ -8,6 +8,12 @@ import {toV2SessionUpdates} from "./AcpV2SessionUpdate";
 import {toV1RequestPermissionResponse, toV2RequestPermissionRequest} from "./AcpV2Permissions";
 import {elicitationSessionId, toV1CreateElicitationResponse, toV2CreateElicitationRequest} from "./AcpV2Elicitation";
 import {logger} from "./Logger";
+import {
+    type LoadSessionReplay,
+    loadSessionReplayOf,
+    tagLoadSessionReplay,
+    withLoadSessionReplayMarks,
+} from "./LoadSessionReplay";
 
 export type AcpClientConnection = Pick<acp.AgentContext, "notify" | "request">;
 
@@ -21,7 +27,7 @@ export class AcpV2Connection {
     private isTurnRunning: (sessionId: string) => boolean = () => true;
 
     constructor(client: AcpV2ClientConnection) {
-        this.client = client;
+        this.client = withLoadSessionReplayMarks(client);
     }
 
     /**
@@ -62,10 +68,14 @@ export class AcpV2Connection {
     /**
      * Sends a session update, rendered in the v2 wire shape, through the v2 `session/update`
      * binding. One update can render to several v2 updates (or none), sent in order.
+     * With a `replay`, each of them is one notification of that replay.
      */
-    async updateSession(sessionId: string, update: AcpSessionUpdate): Promise<void> {
+    async updateSession(sessionId: string, update: AcpSessionUpdate, replay?: LoadSessionReplay | null): Promise<void> {
         for (const v2Update of toV2SessionUpdates(update)) {
-            await this.client.notify(acpV2.methods.client.session.update, {sessionId, update: v2Update});
+            await this.client.notify(
+                acpV2.methods.client.session.update,
+                tagLoadSessionReplay({sessionId, update: v2Update}, replay),
+            );
         }
     }
 
@@ -83,11 +93,16 @@ export class AcpV2Connection {
      * `user_message`, `agent_message` and `agent_thought` exist as whole-message updates; there
      * is no v1 shape for them, so this bypasses `toV2SessionUpdates` entirely.
      */
-    async startReplayMessage(sessionId: string, kind: ReplayMessageKind, messageId: string): Promise<void> {
-        await this.client.notify(acpV2.methods.client.session.update, {
+    async startReplayMessage(
+        sessionId: string,
+        kind: ReplayMessageKind,
+        messageId: string,
+        replay?: LoadSessionReplay | null,
+    ): Promise<void> {
+        await this.client.notify(acpV2.methods.client.session.update, tagLoadSessionReplay({
             sessionId,
             update: {sessionUpdate: kind, messageId, content: []},
-        });
+        }, replay));
     }
 
     /** `updateState`, with send failures caught and logged instead of propagated. */
@@ -165,7 +180,7 @@ export class AcpV2Connection {
                 }
                 if (method === acp.methods.client.session.update) {
                     const notification = params as acp.SessionNotification;
-                    return this.updateSession(notification.sessionId, notification.update);
+                    return this.updateSession(notification.sessionId, notification.update, loadSessionReplayOf(params));
                 }
                 if (method === acp.methods.client.elicitation.complete) {
                     return this.completeElicitation(params as acp.CompleteElicitationNotification);
@@ -211,16 +226,19 @@ function rejectStandardMethod(method: string): Promise<never> {
 /**
  * The single send point for `session/update`. Callers build v1-shaped updates; on a v2
  * connection they are rendered in the v2 wire shape by `toV2SessionUpdates`.
+ * With a `replay`, every update is a notification of that history replay.
  */
 export class ACPSessionConnection {
     private readonly connection: AcpClientConnection;
     private readonly v2Connection: AcpV2Connection | null;
     readonly sessionId: string;
+    private readonly replay: LoadSessionReplay | null;
 
-    constructor(connection: AcpClientConnection, sessionId: string) {
+    constructor(connection: AcpClientConnection, sessionId: string, replay: LoadSessionReplay | null = null) {
         this.connection = connection;
         this.v2Connection = AcpV2Connection.of(connection);
         this.sessionId = sessionId;
+        this.replay = replay;
     }
 
     get protocolVersion(): 1 | 2 {
@@ -240,15 +258,15 @@ export class ACPSessionConnection {
         if (!this.v2Connection) {
             throw acp.RequestError.internalError(undefined, `'${kind}' does not exist in ACP v1`);
         }
-        await this.v2Connection.startReplayMessage(this.sessionId, kind, messageId);
+        await this.v2Connection.startReplayMessage(this.sessionId, kind, messageId, this.replay);
     }
 
     /** On v2, the view renders the update in the v2 shape (`extensionOnlyV1View`). */
     async update(update: UpdateSessionEvent, sessionId: string = this.sessionId) {
-        await this.connection.notify(acp.methods.client.session.update, asSdkSessionNotification({
+        await this.connection.notify(acp.methods.client.session.update, tagLoadSessionReplay(asSdkSessionNotification({
             sessionId,
             update: update
-        }));
+        }), this.replay));
     }
 }
 

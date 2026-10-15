@@ -27,6 +27,7 @@ It describes only this adapter.
 - [Session index](#session-index)
 - [Context compaction](#context-compaction)
 - [Session fork point](#session-fork-point)
+- [Session load replay marks](#session-load-replay-marks)
 - [Presentation hints](#presentation-hints)
 - [Removed keys](#removed-keys)
 
@@ -1326,6 +1327,34 @@ It adds this object to the `session/fork` request:
 - An invalid field fails the request with `invalidParams`.
 - When no message matches, the request fails with `invalidParams`.
 - The fork keeps the history up to the turn that holds the message.
+
+## Session load replay marks
+
+AIR shows the history of a loaded session when the replay is complete.
+ACP has no signal for that other than the response, so the adapter marks the replay.
+The keys are the ones that the JetBrains cloud agent already sends, and AIR already reads them.
+
+The marks apply to the history replay of `session/load`, and of a v2 `session/resume` with `replayFrom: {type: "start"}`.
+Only AIR gets them, as the [Compatibility rule](#compatibility-rule) requires.
+The adapter puts them in the notification `_meta`, next to `sessionId` and `update`:
+
+```json
+{ "sessionId": "thread-1", "update": { "sessionUpdate": "agent_message_chunk", "...": "..." }, "_meta": { "loadSessionReplayIndex": 14, "loadSessionEndOfRecordedHistory": true } }
+```
+
+- `loadSessionReplayIndex` is the 0-based position of the notification in the replay.
+  Every replayed notification of the loaded session has it.
+  The first one is the title of the session, when the replay sends a title.
+- `loadSessionEndOfRecordedHistory: true` is only on the last replayed notification, whatever its kind.
+- The adapter does not send `loadSessionReplaySize`. The history arrives in pages, so the size is not known in advance.
+- The adapter keeps the other keys of the notification `_meta`.
+- A replay with no notification sends no mark.
+- A replay that fails or that the client closes sends no end mark.
+- A live notification has no mark. Examples are the command list, the goal, the MCP startup status, and a turn event.
+- The replayed history of a native subagent goes to its own session and has no mark.
+  The adapter sends it in its place in the replay, so the order of the notifications does not change.
+- The adapter holds back the latest replayed notification until the next one, or until the replay ends.
+  The replayed notifications keep their order. A live notification can arrive before the held one.
 
 ## Presentation hints
 

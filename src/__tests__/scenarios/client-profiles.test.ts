@@ -497,6 +497,8 @@ describe("subagents", () => {
 
             expect(live.map(({update}) => update["sessionUpdate"])).toEqual(["tool_call", "tool_call_update"]);
             expect(replayed).toEqual([{
+                // A replayed update of the loaded session carries its replay position.
+                _meta: {loadSessionReplayIndex: expect.any(Number)},
                 sessionId: SESSION_ID,
                 update: {...live[0]!.update, ...live[1]!.update, sessionUpdate: "tool_call"},
             }]);

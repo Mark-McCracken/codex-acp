@@ -100,6 +100,7 @@ import {SteeringQueue} from "./SteeringQueue";
 import type {QuotaMeta} from "./QuotaMeta";
 import {logger} from "./Logger";
 import {settledWithin} from "./StdUtils";
+import {LoadSessionReplay, withLoadSessionReplayMarks} from "./LoadSessionReplay";
 import type {ToolCallReports} from "./ToolCallReports";
 import {ToolCallReportingConnection} from "./ToolCallReportingConnection";
 import {type AcpMcpServer, getMcpServerName, type WithAcpMcpServers} from "./McpServerConfig";
@@ -583,7 +584,7 @@ export class CodexAcpServer {
         } else {
             this.protocolVersion = 1;
             this.v2Connection = null;
-            this.reportingConnection = new ToolCallReportingConnection(connection);
+            this.reportingConnection = new ToolCallReportingConnection(withLoadSessionReplayMarks(connection));
             this.connection = this.reportingConnection.asClientConnection();
         }
         this.codexAcpClient = codexAcpClient;
@@ -3169,16 +3170,43 @@ export class CodexAcpServer {
     /**
      * Sends the history of a loaded session one page of items at a time. The
      * adapter keeps only the current page, not the whole history.
+     *
+     * For AIR, every update of the replay goes through one {@link LoadSessionReplay}, which marks the end of
+     * the replay on its last update. A failed or closed replay sends no end mark.
      */
     private async streamThreadHistory(
         sessionId: string,
         thread: Thread,
         history: AsyncIterable<ThreadItemEntry[]>,
     ): Promise<void> {
-        const session = new ACPSessionConnection(this.connection, sessionId);
-        const sessionState = this.getSessionState(sessionId);
+        // The replay marks are AIR-only keys, see the compatibility rule in docs/air-extensions.md.
+        const replay = this.capabilities.airClient ? new LoadSessionReplay(sessionId) : null;
         const generation = this.getSessionGeneration(sessionId);
         const isOpen = () => this.getSessionGeneration(sessionId) === generation;
+        try {
+            await this.replayThreadHistory(sessionId, thread, history, replay, isOpen);
+        } catch (err) {
+            await replay?.abandon().catch(sendError => {
+                logger.error(`Failed to send the history of session ${sessionId}`, sendError);
+            });
+            throw err;
+        }
+        if (isOpen()) {
+            await replay?.finish();
+        } else {
+            await replay?.abandon();
+        }
+    }
+
+    private async replayThreadHistory(
+        sessionId: string,
+        thread: Thread,
+        history: AsyncIterable<ThreadItemEntry[]>,
+        replay: LoadSessionReplay | null,
+        isOpen: () => boolean,
+    ): Promise<void> {
+        const session = new ACPSessionConnection(this.connection, sessionId, replay);
+        const sessionState = this.getSessionState(sessionId);
         const pages = history[Symbol.asyncIterator]();
         const first = await pages.next();
         const firstPage = first.done ? [] : first.value;
@@ -3199,6 +3227,7 @@ export class CodexAcpServer {
                 new Set([sessionId]),
                 new Set(),
                 isOpen,
+                replay,
             );
             return;
         }
@@ -3248,8 +3277,9 @@ export class CodexAcpServer {
         ancestry: Set<string>,
         unreadableChildren: Set<string>,
         isOpen: () => boolean,
+        replay: LoadSessionReplay | null,
     ): Promise<void> {
-        const session = new ACPSessionConnection(this.connection, sessionId);
+        const session = new ACPSessionConnection(this.connection, sessionId, replay);
         const announced = new Map<string, {generation: number; sessionId: string; terminal: boolean}>();
         // v2 only (this path also serves v1's native replay, unchanged there).
         const startedReplayMessages = new Set<string>();
@@ -3300,6 +3330,7 @@ export class CodexAcpServer {
                                     new Set([...ancestry, item.agentThreadId]),
                                     unreadableChildren,
                                     isOpen,
+                                    replay,
                                 );
                             }
                             catch (error) {
@@ -3308,6 +3339,9 @@ export class CodexAcpServer {
                                 unreadableChildren.add(item.agentThreadId);
                                 logger.error(`Failed to read subagent history ${item.agentThreadId}`, error);
                             }
+                            // The recovered terminals are sent outside the replay. A parent update follows
+                            // every child, so the held update is not the last one of the replay.
+                            await replay?.release();
                             try {
                                 await sessionState.asyncTasks.recover(
                                     item.agentThreadId,
@@ -3387,7 +3421,7 @@ export class CodexAcpServer {
 
         const historyTitle = this.findFirstUserMessageTitle(firstItems)
             ?? normalizeSessionTitle(thread.preview);
-        await this.publishFallbackSessionTitle(sessionState, historyTitle);
+        await this.publishFallbackSessionTitle(sessionState, historyTitle, session);
     }
 
     private findFirstUserMessageTitle(items: ThreadItem[]): string | null {
@@ -3405,11 +3439,11 @@ export class CodexAcpServer {
     private async publishFallbackSessionTitle(
         sessionState: SessionState,
         title: string | null,
+        session = new ACPSessionConnection(this.connection, sessionState.sessionId),
     ): Promise<void> {
         if (sessionState.sessionTitleSource !== "unset" || !title) return;
         sessionState.sessionTitle = title;
         sessionState.sessionTitleSource = "fallback";
-        const session = new ACPSessionConnection(this.connection, sessionState.sessionId);
         await session.update({
             sessionUpdate: "session_info_update",
             title,
