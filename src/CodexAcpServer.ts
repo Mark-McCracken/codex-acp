@@ -319,6 +319,7 @@ const NO_ACTIVE_TURN_RETRY_DELAYS_MS = [25, 50, 100, 200, 400];
 
 /**
  * How long after its start `session/load` waits for the account read when `thread/resume` is done or failed.
+ * After a resume, the load streams the history first and waits for the rest of the grace time before it answers.
  * A missing login needs no network call, so the read answers fast and the load fails with `auth_required`.
  * A ChatGPT login waits for the ChatGPT backend, which the app-server waits for up to 15 s.
  * Such a read can still find a login that does not work, for example a revoked token (401).
@@ -1300,12 +1301,14 @@ export class CodexAcpServer {
      * - An unavailable read changes nothing.
      * - Any other failure is logged as an error and pushes nothing. It tells nothing sure about the login,
      *   so the client keeps the last status.
+     *
+     * The returned promise settles when the answer is applied. It never rejects.
      */
     private applyLateAccountRead(
         sessionState: SessionState,
         authorization: Promise<KnownAccount>,
         authStatusVersionAtStart: number,
-    ): void {
+    ): Promise<void> {
         const sessionIsCurrent = () => this.sessions.get(sessionState.sessionId) === sessionState;
         const answerIsCurrent = () => {
             if (!sessionIsCurrent()) {
@@ -1318,7 +1321,7 @@ export class CodexAcpServer {
             }
             return true;
         };
-        void authorization.then(
+        return authorization.then(
             async knownAccount => {
                 if (knownAccount === "unavailable" || !answerIsCurrent()) return;
                 const authState = await this.getAuthStateForProvider(sessionState.authProvider, knownAccount);
@@ -1612,6 +1615,7 @@ export class CodexAcpServer {
             history,
             sessionState,
             settleTrackerReady,
+            awaitAccountRead,
         } = await this.getOrCreateSessionWithHistory(params);
 
         try {
@@ -1622,15 +1626,18 @@ export class CodexAcpServer {
                 // live events, so a live goal-turn frame can never race ahead of history.
                 settleTrackerReady(sessionState);
             }
+            // The account read runs while the history streams. A read that finds no login within the grace
+            // time still fails the load, after the replay.
+            await awaitAccountRead();
         } catch (err) {
             // A close during the load already closed the session.
             if (err instanceof SessionClosedDuringLoadError) {
                 throw RequestError.invalidRequest(`Session ${sessionId} is closing`);
             }
-            // The history pages are read after the session is installed, so a failed read closes the
-            // session again. The client never gets a half-open session.
+            // The history pages and the account are read after the session is installed, so a failed read
+            // closes the session again. The client never gets a half-open session.
             await this.closeSession({sessionId}).catch(closeError => {
-                logger.error(`Failed to close session ${sessionId} after a failed history read`, closeError);
+                logger.error(`Failed to close session ${sessionId} after a failed load`, closeError);
             });
             throw this.recovery?.mapError(err) ?? err;
         }
@@ -3009,6 +3016,9 @@ export class CodexAcpServer {
         // Settles the baseline tracker's `ready` gate; resolve after `streamThreadHistory` so a
         // live goal-turn frame Codex fires right after resume/load never races ahead of replay.
         settleTrackerReady: (state: SessionState | null) => void;
+        // Waits for an account read that was still running when the session was installed, within the grace
+        // time. Rejects when the read failed within it, for example with `auth_required`.
+        awaitAccountRead: () => Promise<void>;
     }> {
         const requestedSessionGeneration = this.beginSessionOpen(request.sessionId);
         const loadStartedAt = performance.now();
@@ -3035,6 +3045,7 @@ export class CodexAcpServer {
         this.startCodexTurnTracker(request.sessionId, trackerReady);
         let sessionMetadata: SessionMetadataWithThread;
         let knownAccount: KnownAccount | "pending";
+        let accountReadWithinGrace: Promise<KnownAccount | "pending">;
         // The app-server that loads the thread, read in the closure that loads it. A crash after the load makes the
         // session stale, see AppServerRecovery.
         let openGeneration = this.recovery?.generation ?? 0;
@@ -3055,7 +3066,12 @@ export class CodexAcpServer {
                 await settledWithin(authorization, graceLeftMs());
                 throw err;
             }
-            knownAccount = await settledWithin(authorization, graceLeftMs());
+            // The load waits for the account read only within the grace time. It starts that wait now, but awaits
+            // it only before it answers, so a read that waits for the network does not hold back the history.
+            accountReadWithinGrace = settledWithin(authorization, graceLeftMs());
+            accountReadWithinGrace.catch(() => {});
+            // A read that already ended applies now. A missing login then fails the load before the replay.
+            knownAccount = await settledWithin(authorization, 0);
         } catch (err) {
             settleTrackerReady(null);
             if (subscribed) {
@@ -3138,9 +3154,9 @@ export class CodexAcpServer {
         );
         this.installSessionState(sessionState);
         this.recovery?.markLoaded(sessionState, openGeneration);
-        if (knownAccount === "pending") {
-            this.applyLateAccountRead(sessionState, authorization, authStatusVersionAtStart);
-        }
+        const lateAccountRead = knownAccount === "pending"
+            ? this.applyLateAccountRead(sessionState, authorization, authStatusVersionAtStart)
+            : null;
         subscribed = false;
 
         if (requestedMcpServers.length > 0 && mcpServerStartupVersion !== null) {
@@ -3164,6 +3180,13 @@ export class CodexAcpServer {
             history: sessionMetadata.history,
             sessionState: sessionState,
             settleTrackerReady: settleTrackerReady,
+            awaitAccountRead: async () => {
+                if (lateAccountRead === null) return;
+                // A read that fails within the grace time rejects here, as it did before the replay.
+                if (await accountReadWithinGrace === "pending") return;
+                // The session gets the account of a read that ended within the grace time before the load answers.
+                await lateAccountRead;
+            },
         };
     }
 

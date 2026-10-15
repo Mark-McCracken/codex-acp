@@ -88,4 +88,53 @@ describe("CodexACPAgent - loadSession auth", () => {
         await expect(fixture.getCodexAcpAgent().loadSession({sessionId: SESSION_ID, cwd: "/test/project", mcpServers: []}))
             .rejects.toMatchObject({code: -32000});
     });
+
+    it("streams the history before a slow account read ends, and answers with the account of the read", async () => {
+        const fixture = loadFixture();
+        const appServer = fixture.getCodexAppServerClient();
+        let answer: (response: GetAccountResponse) => void = () => {};
+        appServer.accountRead = vi.fn()
+            .mockResolvedValueOnce(SIGNED_IN)
+            .mockImplementation(() => new Promise<GetAccountResponse>(resolve => answer = resolve));
+        await initialize(fixture);
+
+        let answered = false;
+        const load = fixture.getCodexAcpAgent().loadSession({sessionId: SESSION_ID, cwd: "/test/project", mcpServers: []})
+            .finally(() => answered = true);
+        await vi.waitFor(() => expect(historyText(fixture)).toEqual(["history"]));
+
+        expect(answered).toBe(false);
+        answer(SIGNED_IN);
+        await load;
+        expect(fixture.getCodexAcpAgent().getSessionState(SESSION_ID).account).toEqual(SIGNED_IN.account);
+    });
+
+    it("fails with auth_required and closes the session when the read finds no login after the history", async () => {
+        const fixture = loadFixture();
+        const client = fixture.getCodexAcpClient();
+        const appServer = fixture.getCodexAppServerClient();
+        let answer: (response: GetAccountResponse) => void = () => {};
+        appServer.accountRead = vi.fn()
+            .mockResolvedValueOnce(SIGNED_IN)
+            .mockImplementation(() => new Promise<GetAccountResponse>(resolve => answer = resolve));
+        const closeSpy = vi.spyOn(client, "closeSession").mockResolvedValue(undefined as never);
+        await initialize(fixture);
+
+        const load = fixture.getCodexAcpAgent().loadSession({sessionId: SESSION_ID, cwd: "/test/project", mcpServers: []});
+        await vi.waitFor(() => expect(historyText(fixture)).toEqual(["history"]));
+        answer({account: null, requiresOpenaiAuth: true} as GetAccountResponse);
+
+        await expect(load).rejects.toMatchObject({code: -32000});
+        expect(closeSpy).toHaveBeenCalledWith(SESSION_ID);
+        expect(() => fixture.getCodexAcpAgent().getSessionState(SESSION_ID)).toThrow();
+    });
 });
+
+/** The text of the replayed agent messages that reached the client. */
+function historyText(fixture: CodexMockTestFixture): string[] {
+    return fixture.getAcpConnectionEvents([])
+        .filter(event => event.method === "sessionUpdate")
+        .map(event => event.args[0].update)
+        .filter(update => update.sessionUpdate === "agent_message_chunk")
+        .map(update => update.content.text);
+}
