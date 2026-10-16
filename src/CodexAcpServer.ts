@@ -516,11 +516,11 @@ export class CodexAcpServer {
     /** Sessions with a v2 prompt that has not finished yet, including before its turn starts. */
     private readonly v2PromptsInFlight = new Set<string>();
     /**
-     * Per-session callbacks that abort a v2 `session/prompt` still waiting in the turn-start FIFO
-     * (queued behind a running turn, not yet inserted). `session/cancel`/`session/close` drop the
-     * whole queue for a session by invoking every registered callback here.
+     * Per-session callbacks that abort a request still waiting before its turn: a v2 `session/prompt`
+     * queued behind a running turn, or a prompt, a steer or a goal resume that waits for a load of the
+     * session. `session/cancel`/`session/close` drop all of them by invoking every callback here.
      */
-    private readonly queuedV2PromptCancellers = new Map<string, Set<() => void>>();
+    private readonly waitingRequestCancellers = new Map<string, Set<() => void>>();
     private readonly closingSessions: Map<string, number>;
     private readonly sessionGenerations: Map<string, number>;
     private readonly sessionOpenGenerations: Map<string, number>;
@@ -837,9 +837,15 @@ export class CodexAcpServer {
             }
             case GOAL_CONTROL_METHOD:
             case LEGACY_GOAL_CONTROL_METHOD: {
-                // A goal resume can start a turn.
+                // A goal resume can start a turn, so `session/cancel` drops it while it waits for a load.
                 const pendingLoads = this.sessionLoads.whenIdle(methodRequest.params.sessionId);
-                if (pendingLoads) await pendingLoads;
+                if (pendingLoads) {
+                    if (methodRequest.params.action !== "resume") {
+                        await pendingLoads;
+                    } else if (await this.waitUnlessCancelled(methodRequest.params.sessionId, pendingLoads)) {
+                        throw RequestError.requestCancelled(undefined, `Session ${methodRequest.params.sessionId} was cancelled before the goal resumed`);
+                    }
+                }
                 const sessionState = this.sessions.get(methodRequest.params.sessionId);
                 if (!sessionState) {
                     throw RequestError.invalidParams(undefined, `Unknown session: ${methodRequest.params.sessionId}`);
@@ -1784,8 +1790,8 @@ export class CodexAcpServer {
         this.beginSessionCloseFence(params.sessionId);
 
         try {
-            // Same as `session/cancel`: drop every v2 prompt still queued for this session first.
-            this.cancelQueuedV2Prompts(params.sessionId);
+            // Same as `session/cancel`: drop every request still waiting before its turn first.
+            this.cancelWaitingRequests(params.sessionId);
             if (sessionState) {
                 await this.interruptSessionTurn(sessionState, "Close", true);
                 sessionState.asyncTasks.clear();
@@ -1814,7 +1820,7 @@ export class CodexAcpServer {
                 this.pendingTurnStarts.delete(params.sessionId);
                 this.activePrompts.delete(params.sessionId);
                 this.turnStartQueueTail.delete(params.sessionId);
-                this.queuedV2PromptCancellers.delete(params.sessionId);
+                this.waitingRequestCancellers.delete(params.sessionId);
                 this.steeringQueues.delete(params.sessionId);
             }
             this.endSessionCloseFence(params.sessionId);
@@ -2639,7 +2645,9 @@ export class CodexAcpServer {
      */
     async executeOrQueueSteeringRequest(params: SessionSteerRequest): Promise<SessionSteeringResponse> {
         const pendingLoads = this.sessionLoads.whenIdle(params.sessionId);
-        if (pendingLoads) await pendingLoads;
+        if (pendingLoads && await this.waitUnlessCancelled(params.sessionId, pendingLoads)) {
+            throw RequestError.requestCancelled(undefined, `Session ${params.sessionId} was cancelled before the steer was applied`);
+        }
         const queue = this.getSteeringQueue(params.sessionId);
         try {
             return await queue.enqueue(params);
@@ -3902,23 +3910,52 @@ export class CodexAcpServer {
     }
 
     /**
-     * Registers a callback that aborts a v2 `session/prompt` still queued behind a running turn.
-     * Returns an unregister function the caller must invoke once it stops waiting (whether it was
-     * cancelled or reached the front of the queue on its own).
+     * Waits for `wait` unless `session/cancel`, `session/close` or the abort of `signal` drops the
+     * request first. Returns `true` when the request was dropped. In both cases the request is no
+     * longer registered when this returns.
      */
-    private registerQueuedV2PromptCanceller(sessionId: string, canceller: () => void): () => void {
-        let cancellers = this.queuedV2PromptCancellers.get(sessionId);
+    private async waitUnlessCancelled(sessionId: string, wait: Promise<void>, signal?: AbortSignal): Promise<boolean> {
+        let cancelled = false;
+        let markCancelled: () => void = () => { cancelled = true; };
+        const cancelSignal = new Promise<void>((resolve) => {
+            markCancelled = () => { cancelled = true; resolve(); };
+        });
+        const unregister = this.registerWaitingRequestCanceller(sessionId, markCancelled);
+        const onRequestCancelled = () => markCancelled();
+        if (signal) {
+            if (signal.aborted) {
+                onRequestCancelled();
+            } else {
+                signal.addEventListener("abort", onRequestCancelled, {once: true});
+            }
+        }
+        try {
+            await Promise.race([wait, cancelSignal]);
+        } finally {
+            unregister();
+            signal?.removeEventListener("abort", onRequestCancelled);
+        }
+        return cancelled;
+    }
+
+    /**
+     * Registers a callback that aborts a request still waiting before its turn.
+     * Returns an unregister function the caller must invoke once it stops waiting (whether it was
+     * cancelled or its wait ended on its own).
+     */
+    private registerWaitingRequestCanceller(sessionId: string, canceller: () => void): () => void {
+        let cancellers = this.waitingRequestCancellers.get(sessionId);
         if (!cancellers) {
             cancellers = new Set();
-            this.queuedV2PromptCancellers.set(sessionId, cancellers);
+            this.waitingRequestCancellers.set(sessionId, cancellers);
         }
         cancellers.add(canceller);
         return () => cancellers!.delete(canceller);
     }
 
-    /** Aborts every v2 `session/prompt` currently queued (not yet inserted) for a session. */
-    private cancelQueuedV2Prompts(sessionId: string): void {
-        const cancellers = this.queuedV2PromptCancellers.get(sessionId);
+    /** Aborts every request of a session that still waits before its turn. */
+    private cancelWaitingRequests(sessionId: string): void {
+        const cancellers = this.waitingRequestCancellers.get(sessionId);
         if (!cancellers) {
             return;
         }
@@ -4087,9 +4124,12 @@ export class CodexAcpServer {
      * message; a locally handled command has no Codex turn, so it is inserted right away.
      */
     async promptV2(params: acpV2.PromptRequest, signal?: AbortSignal): Promise<acpV2.PromptResponse> {
-        const pendingLoads = this.sessionLoads.whenIdle(params.sessionId);
-        if (pendingLoads) await pendingLoads;
         const sessionId = params.sessionId;
+        // A prompt that waits for a load is dropped like a prompt queued behind a running turn, see below.
+        const pendingLoads = this.sessionLoads.whenIdle(sessionId);
+        if (pendingLoads && await this.waitUnlessCancelled(sessionId, pendingLoads, signal)) {
+            throw RequestError.requestCancelled(undefined, `Session ${sessionId} was cancelled before the prompt was inserted`);
+        }
         const request = toV1PromptRequest(params);
         const sessionState = this.getSessionState(sessionId);
         if (this.sessionIsClosing(sessionId)) {
@@ -4099,36 +4139,16 @@ export class CodexAcpServer {
         // session's place in the shared turn-start FIFO now (before any await), then wait. Nothing
         // observable (response, user message, states) happens until this prompt reaches the front.
         const reservation = this.acquireTurnStartReservation(sessionId);
-        if (reservation.needsWait) {
-            // `session/cancel`/`session/close` drop this prompt while it waits here: race the
-            // FIFO wait against a cancellation signal so the client sees `-32800` right away,
-            // instead of only once the running turn ahead of it actually finishes. A
-            // `$/cancel_request` for this specific request goes through the same canceller, so it
-            // only drops this prompt and leaves the rest of the queue untouched.
-            let cancelled = false;
-            let markCancelled: () => void = () => { cancelled = true; };
-            const cancelSignal = new Promise<void>((resolve) => {
-                markCancelled = () => { cancelled = true; resolve(); };
-            });
-            const unregister = this.registerQueuedV2PromptCanceller(sessionId, markCancelled);
-            const onRequestCancelled = () => markCancelled();
-            if (signal) {
-                if (signal.aborted) {
-                    onRequestCancelled();
-                } else {
-                    signal.addEventListener("abort", onRequestCancelled, {once: true});
-                }
-            }
-            await Promise.race([reservation.wait, cancelSignal]);
-            unregister();
-            signal?.removeEventListener("abort", onRequestCancelled);
-            if (cancelled) {
-                // Still release in the FIFO's own order once it is actually this prompt's turn,
-                // so anything queued behind it does not start while the current turn is still
-                // being interrupted.
-                void reservation.wait.then(() => reservation.release());
-                throw RequestError.requestCancelled(undefined, `Session ${sessionId} was cancelled before the prompt was inserted`);
-            }
+        // `session/cancel`/`session/close` drop this prompt while it waits here, so the client
+        // sees `-32800` right away, instead of only once the running turn ahead of it actually
+        // finishes. A `$/cancel_request` for this specific request only drops this prompt and
+        // leaves the rest of the queue untouched.
+        if (reservation.needsWait && await this.waitUnlessCancelled(sessionId, reservation.wait, signal)) {
+            // Still release in the FIFO's own order once it is actually this prompt's turn,
+            // so anything queued behind it does not start while the current turn is still
+            // being interrupted.
+            void reservation.wait.then(() => reservation.release());
+            throw RequestError.requestCancelled(undefined, `Session ${sessionId} was cancelled before the prompt was inserted`);
         }
         const promptKind = this.availableCommands.classifyPrompt(request.prompt);
         const messageId = randomUUID();
@@ -4293,7 +4313,11 @@ export class CodexAcpServer {
         const ownsReservation = reservation === undefined;
         // A caller with a reservation waited for the loads of the session before it took the reservation.
         const pendingLoads = ownsReservation ? this.sessionLoads.whenIdle(params.sessionId) : null;
-        if (pendingLoads) await pendingLoads;
+        if (pendingLoads && await this.waitUnlessCancelled(params.sessionId, pendingLoads, signal)) {
+            // A cancel during the load ends the prompt before its turn, with the `cancelled` stop reason of ACP v1.
+            const sessionState = this.sessions.get(params.sessionId);
+            return sessionState ? this.cancelledPromptResponse(sessionState) : {stopReason: "cancelled"};
+        }
         const activeReservation = reservation ?? this.acquireTurnStartReservation(params.sessionId);
         if (activeReservation.needsWait) {
             await activeReservation.wait;
@@ -5132,6 +5156,10 @@ export class CodexAcpServer {
 
     async cancel(params: acp.CancelNotification): Promise<void> {
         this.activePrompts.get(params.sessionId)?.requestClientCancel();
+        // Drop every request still waiting before its turn before interrupting the running turn,
+        // so their responses do not wait on the interrupt completing. A request that waits for
+        // the first load of a session has no session state yet.
+        this.cancelWaitingRequests(params.sessionId);
         const sessionState = this.sessions.get(params.sessionId);
         if (!sessionState) {
             logger.log("Cancel request rejected: session not found", {sessionId: params.sessionId});
@@ -5147,9 +5175,6 @@ export class CodexAcpServer {
             activePrompt.abortInteractions();
         }
 
-        // Drop every v2 prompt still queued (not yet inserted) before interrupting the running
-        // turn, so their `-32800` responses do not wait on the interrupt completing. No-op on v1.
-        this.cancelQueuedV2Prompts(params.sessionId);
         // After turnInterrupt(), Codex will send turn/completed, which naturally completes awaitTurnCompleted().
         await this.interruptSessionTurn(sessionState, "Cancel", false);
     }

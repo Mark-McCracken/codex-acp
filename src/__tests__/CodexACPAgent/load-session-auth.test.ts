@@ -270,6 +270,74 @@ describe("CodexACPAgent - loadSession auth", () => {
         await prompt;
     });
 
+    it("drops a v2 prompt that waits for the load on session/cancel, and starts no turn after the load", async () => {
+        const {fixture, agent, answer, load} = await startHeldLoad();
+
+        let failure: unknown = null;
+        const prompt = agent.promptV2({sessionId: SESSION_ID, prompt: [{type: "text", text: "Run the tests"}]})
+            .catch(error => failure = error);
+        await settle();
+        await agent.cancel({sessionId: SESSION_ID});
+        await prompt;
+
+        expect(failure).toMatchObject({code: -32800});
+        answer(SIGNED_IN);
+        await load;
+        await settle();
+        expect(fixture.getCodexAppServerClient().turnStart).not.toHaveBeenCalled();
+    });
+
+    it("drops a v2 prompt that waits for the load when the client cancels its request", async () => {
+        const {fixture, agent, answer, load} = await startHeldLoad();
+
+        const request = new AbortController();
+        let failure: unknown = null;
+        const prompt = agent.promptV2({sessionId: SESSION_ID, prompt: [{type: "text", text: "Run the tests"}]}, request.signal)
+            .catch(error => failure = error);
+        await settle();
+        request.abort();
+        await prompt;
+
+        expect(failure).toMatchObject({code: -32800});
+        answer(SIGNED_IN);
+        await load;
+        await settle();
+        expect(fixture.getCodexAppServerClient().turnStart).not.toHaveBeenCalled();
+    });
+
+    it("answers cancelled to a v1 prompt that waits for the load on session/cancel, and starts no turn", async () => {
+        const {fixture, agent, answer, load} = await startHeldLoad();
+
+        const prompt = agent.prompt({sessionId: SESSION_ID, prompt: [{type: "text", text: "Run the tests"}]});
+        await settle();
+        await agent.cancel({sessionId: SESSION_ID});
+
+        await expect(prompt).resolves.toMatchObject({stopReason: "cancelled"});
+        answer(SIGNED_IN);
+        await load;
+        await settle();
+        expect(fixture.getCodexAppServerClient().turnStart).not.toHaveBeenCalled();
+    });
+
+    it("drops a steer that waits for the load on session/cancel, and starts no turn after the load", async () => {
+        const {fixture, agent, answer, load} = await startHeldLoad();
+        const appServer = fixture.getCodexAppServerClient();
+
+        let failure: unknown = null;
+        const steer = agent.executeOrQueueSteeringRequest({sessionId: SESSION_ID, prompt: [{type: "text", text: "Stop"}]})
+            .catch(error => failure = error);
+        await settle();
+        await agent.cancel({sessionId: SESSION_ID});
+        await steer;
+
+        expect(failure).toMatchObject({code: -32800});
+        answer(SIGNED_IN);
+        await load;
+        await settle();
+        expect(appServer.turnStart).not.toHaveBeenCalled();
+        expect(appServer.turnSteer).not.toHaveBeenCalled();
+    });
+
     it("loads two sessions at the same time", async () => {
         const fixture = loadFixture();
         const appServer = fixture.getCodexAppServerClient();
@@ -301,6 +369,24 @@ describe("CodexACPAgent - loadSession auth", () => {
         expect(agent.getSessionState("session-2").sessionId).toBe("session-2");
     });
 });
+
+/** Starts a load whose account read waits for `answer`, and waits until its history arrived. */
+async function startHeldLoad() {
+    const fixture = loadFixture();
+    const appServer = fixture.getCodexAppServerClient();
+    let answer: (response: GetAccountResponse) => void = () => {};
+    appServer.accountRead = vi.fn()
+        .mockResolvedValueOnce(SIGNED_IN)
+        .mockImplementationOnce(() => new Promise<GetAccountResponse>(resolve => answer = resolve))
+        .mockResolvedValue(SIGNED_IN);
+    appServer.turnStart = vi.fn().mockResolvedValue({turn: {id: "turn-prompt", items: [], status: "inProgress", error: null}});
+    appServer.turnSteer = vi.fn();
+    await initialize(fixture);
+    const agent = fixture.getCodexAcpAgent();
+    const load = agent.loadSession({sessionId: SESSION_ID, cwd: "/test/project", mcpServers: []});
+    await vi.waitFor(() => expect(historyText(fixture)).toEqual(["history"]));
+    return {fixture, agent, answer: (response: GetAccountResponse) => answer(response), load};
+}
 
 function deferred<T>(): [Promise<T>, (value: T) => void] {
     let resolve!: (value: T) => void;

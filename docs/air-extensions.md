@@ -1353,6 +1353,8 @@ The adapter puts them in the notification `_meta`, next to `sessionId` and `upda
   A load that fails sends no live turn event.
 - While a load of a session runs, the other opens and the prompts of that session wait until the load answers or fails.
   So the replay of each load is whole, and has its own marks. A close of the session does not wait.
+- `session/cancel` and `session/close` drop a prompt, a steer or a goal resume that waits for a load, at once.
+  A v1 prompt answers `cancelled`. The other requests fail with `-32800`. A dropped request starts no turn.
 - The adapter does not send `loadSessionReplaySize`. The history arrives in pages, so the size is not known in advance.
 - The adapter keeps the other keys of the notification `_meta`.
 - A replay with no notification sends no mark.

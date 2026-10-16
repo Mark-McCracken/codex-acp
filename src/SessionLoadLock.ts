@@ -4,7 +4,8 @@
  * A load is a v1 `session/load` or a v2 `session/resume` with `replayFrom: start`. While a load of a session
  * runs, a second load of that session starts only after the first one answered or failed. Another open and a
  * prompt of the session call {@link whenIdle} first, so they also wait for the load. The loads of different
- * sessions do not wait for each other. A close of the session does not wait for the lock.
+ * sessions do not wait for each other. A close of the session does not wait for the lock. A cancel or a close
+ * of the session drops a waiting request that can start a turn.
  */
 export class SessionLoadLock {
     // The end of the last queued load of each session. It never rejects.
