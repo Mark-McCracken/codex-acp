@@ -134,6 +134,38 @@ describe("CodexACPAgent - loadSession replay marks", () => {
         expect(marked.map(notification => notification._meta)).toEqual([{loadSessionReplayIndex: 0}]);
     });
 
+    it("runs a second load of the session after the first one answers, and marks each replay on its own", async () => {
+        let answerFirstReplay: () => void = () => {};
+        const fixture = setUpLoad([
+            async () => ({data: [message("m2")], nextCursor: null, backwardsCursor: null}),
+            () => new Promise(resolve => answerFirstReplay = () => resolve(
+                {data: [message("m1"), message("m2")], nextCursor: null, backwardsCursor: null},
+            )),
+            async () => ({data: [message("m2")], nextCursor: null, backwardsCursor: null}),
+            async () => ({data: [message("m1"), message("m2")], nextCursor: null, backwardsCursor: null}),
+        ]);
+        const appServer = fixture.getCodexAppServerClient();
+        let resumesAtFirstAnswer = -1;
+        const first = load(fixture).then(() => {
+            resumesAtFirstAnswer = vi.mocked(appServer.threadResume).mock.calls.length;
+        });
+        await vi.waitFor(() => expect(appServer.threadItemsList).toHaveBeenCalledTimes(2));
+        const second = fixture.getCodexAcpAgent().loadSession({sessionId: SESSION_ID, cwd: "/test/project", mcpServers: []});
+
+        answerFirstReplay();
+        await first;
+        await second;
+
+        expect(resumesAtFirstAnswer).toBe(1);
+        expect(appServer.threadResume).toHaveBeenCalledTimes(2);
+        expect(replayMarks(notifications(fixture).filter(notification => notification._meta !== undefined))).toEqual([
+            ["agent_message_chunk m1", {loadSessionReplayIndex: 0}],
+            ["agent_message_chunk m2", {loadSessionReplayIndex: 1, loadSessionEndOfRecordedHistory: true}],
+            ["agent_message_chunk m1", {loadSessionReplayIndex: 0}],
+            ["agent_message_chunk m2", {loadSessionReplayIndex: 1, loadSessionEndOfRecordedHistory: true}],
+        ]);
+    });
+
     it("marks nothing for a client that is not AIR", async () => {
         const fixture = setUpLoad([
             async () => ({data: [message("m1")], nextCursor: null, backwardsCursor: null}),

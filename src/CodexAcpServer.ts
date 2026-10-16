@@ -97,6 +97,7 @@ import type {TokenCount} from "./TokenCount";
 import {PromptTokenUsage, toPromptUsage, ZERO_TOKEN_COUNT} from "./TokenCount";
 import {CodexCommands} from "./CodexCommands";
 import {SteeringQueue} from "./SteeringQueue";
+import {SessionLoadLock} from "./SessionLoadLock";
 import type {QuotaMeta} from "./QuotaMeta";
 import {logger} from "./Logger";
 import {settledWithin} from "./StdUtils";
@@ -523,6 +524,8 @@ export class CodexAcpServer {
     private readonly closingSessions: Map<string, number>;
     private readonly sessionGenerations: Map<string, number>;
     private readonly sessionOpenGenerations: Map<string, number>;
+    /** Holds back the other opens and the prompts of a session while a load of it runs. */
+    private readonly sessionLoads = new SessionLoadLock();
     private readonly permissionLifecycleContexts: WeakMap<SessionState, PermissionLifecycleContext>;
     private readonly codexProcessState: CodexProcessState | null;
     /** Brings the app-server back after a crash; `null` without a process state (tests). */
@@ -834,6 +837,9 @@ export class CodexAcpServer {
             }
             case GOAL_CONTROL_METHOD:
             case LEGACY_GOAL_CONTROL_METHOD: {
+                // A goal resume can start a turn.
+                const pendingLoads = this.sessionLoads.whenIdle(methodRequest.params.sessionId);
+                if (pendingLoads) await pendingLoads;
                 const sessionState = this.sessions.get(methodRequest.params.sessionId);
                 if (!sessionState) {
                     throw RequestError.invalidParams(undefined, `Unknown session: ${methodRequest.params.sessionId}`);
@@ -1578,7 +1584,7 @@ export class CodexAcpServer {
         const appServer = this.ensureAppServer();
         if (appServer) await appServer;
         logger.log("Loading session...", {sessionId: params.sessionId});
-        const {sessionId, modelState, modeState} = await this.loadSessionAndReplayHistory(params);
+        const {sessionId, modelState, modeState, sessionState} = await this.loadSessionAndReplayHistory(params);
 
         logger.log("Session loaded", {
             sessionId: sessionId,
@@ -1588,7 +1594,7 @@ export class CodexAcpServer {
         return {
             models: modelState,
             modes: modeState,
-            ...this.createSessionConfigOptionsResponse(this.getSessionState(sessionId)),
+            ...this.createSessionConfigOptionsResponse(sessionState),
         };
     }
 
@@ -1596,12 +1602,25 @@ export class CodexAcpServer {
      * Shared by v1 `session/load` and v2 `session/resume` with `replayFrom: {type: "start"}`:
      * reattach, replay retained history as ordinary `session/update`s, then answer.
      */
-    private async loadSessionAndReplayHistory(
+    private loadSessionAndReplayHistory(
         params: WithAcpMcpServers<acp.LoadSessionRequest>,
     ): Promise<{
         sessionId: SessionId;
         modelState: LegacySessionModelState;
         modeState: SessionModeState;
+        // The state that this load installed.
+        sessionState: SessionState;
+    }> {
+        return this.sessionLoads.run(params.sessionId, () => this.loadSessionAndReplayHistoryLocked(params));
+    }
+
+    private async loadSessionAndReplayHistoryLocked(
+        params: WithAcpMcpServers<acp.LoadSessionRequest>,
+    ): Promise<{
+        sessionId: SessionId;
+        modelState: LegacySessionModelState;
+        modeState: SessionModeState;
+        sessionState: SessionState;
     }> {
         // Captured before the load installs a fresh SessionState: a title
         // generation started by an earlier turn on this session belongs to the
@@ -1616,22 +1635,33 @@ export class CodexAcpServer {
             sessionState,
             settleTrackerReady,
             awaitAccountRead,
+            sessionGeneration,
         } = await this.getOrCreateSessionWithHistory(params);
 
+        // A close of the session during the load makes the state of this load stale.
+        const loadIsCurrent = () => this.sessions.get(sessionId) === sessionState
+            && this.sessionOpenCanInstall(sessionId, sessionGeneration);
         try {
+            let trackerState: SessionState | null = null;
             try {
                 await this.streamThreadHistory(sessionId, thread, history);
+                // A replay that sees a late close ends without an error.
+                if (!loadIsCurrent()) throw new SessionClosedDuringLoadError();
+                // The account read runs while the history streams. A read that finds no login within the grace
+                // time still fails the load, after the replay.
+                await awaitAccountRead();
+                // A close during the account wait does not reject the read.
+                if (!loadIsCurrent()) throw new SessionClosedDuringLoadError();
+                trackerState = sessionState;
             } finally {
-                // Only after replay is fully streamed does the baseline tracker start dispatching
-                // live events, so a live goal-turn frame can never race ahead of history.
-                settleTrackerReady(sessionState);
+                // The baseline tracker sends live events only after the replay and the account wait. A live
+                // goal-turn frame never comes before the history, and a load that fails sends no live event.
+                settleTrackerReady(trackerState);
             }
-            // The account read runs while the history streams. A read that finds no login within the grace
-            // time still fails the load, after the replay.
-            await awaitAccountRead();
         } catch (err) {
-            // A close during the load already closed the session.
-            if (err instanceof SessionClosedDuringLoadError) {
+            // A close during the load already closed the session. After a close and a new open of the session,
+            // this load is stale, so it must not close the new session.
+            if (err instanceof SessionClosedDuringLoadError || !loadIsCurrent()) {
                 throw RequestError.invalidRequest(`Session ${sessionId} is closing`);
             }
             // The history pages and the account are read after the session is installed, so a failed read
@@ -1641,12 +1671,12 @@ export class CodexAcpServer {
             });
             throw this.recovery?.mapError(err) ?? err;
         }
-        await this.getSessionState(sessionId).asyncTasks.reconcile();
+        await sessionState.asyncTasks.reconcile();
         // A load response means "the replay is complete"; a late rename echo
         // from a still-running title generation would arrive after it.
         await previousTitleGen?.waitForIdle(TITLE_GENERATION_SETTLE_TIMEOUT_MS);
 
-        return {sessionId, modelState, modeState};
+        return {sessionId, modelState, modeState, sessionState};
     }
 
     async resumeSession(params: WithAcpMcpServers<acp.ResumeSessionRequest>): Promise<LegacyResumeSessionResponse> {
@@ -1656,6 +1686,8 @@ export class CodexAcpServer {
     }
 
     private async resumeSessionOnce(params: WithAcpMcpServers<acp.ResumeSessionRequest>): Promise<LegacyResumeSessionResponse> {
+        const pendingLoads = this.sessionLoads.whenIdle(params.sessionId);
+        if (pendingLoads) await pendingLoads;
         if (this.providerUpdate !== null) {
             await this.waitForProviderUpdate();
         }
@@ -1685,11 +1717,13 @@ export class CodexAcpServer {
         if (replayFrom.type !== "start") {
             throw RequestError.invalidParams(undefined, `Unsupported replayFrom type: ${replayFrom.type}`);
         }
-        const {sessionId} = await this.loadSessionAndReplayHistory(request);
-        return this.createSessionConfigOptionsResponseV2(this.getSessionState(sessionId));
+        const {sessionState} = await this.loadSessionAndReplayHistory(request);
+        return this.createSessionConfigOptionsResponseV2(sessionState);
     }
 
     async forkSession(params: WithAcpMcpServers<acp.ForkSessionRequest>): Promise<acp.ForkSessionResponse> {
+        const pendingLoads = this.sessionLoads.whenIdle(params.sessionId);
+        if (pendingLoads) await pendingLoads;
         if (this.providerUpdate !== null) {
             await this.waitForProviderUpdate();
         }
@@ -2604,6 +2638,8 @@ export class CodexAcpServer {
      *     {@link performSteeringRequest}.
      */
     async executeOrQueueSteeringRequest(params: SessionSteerRequest): Promise<SessionSteeringResponse> {
+        const pendingLoads = this.sessionLoads.whenIdle(params.sessionId);
+        if (pendingLoads) await pendingLoads;
         const queue = this.getSteeringQueue(params.sessionId);
         try {
             return await queue.enqueue(params);
@@ -3019,6 +3055,8 @@ export class CodexAcpServer {
         // Waits for an account read that was still running when the session was installed, within the grace
         // time. Rejects when the read failed within it, for example with `auth_required`.
         awaitAccountRead: () => Promise<void>;
+        // The generation of the session when the load started.
+        sessionGeneration: number;
     }> {
         const requestedSessionGeneration = this.beginSessionOpen(request.sessionId);
         const loadStartedAt = performance.now();
@@ -3154,9 +3192,6 @@ export class CodexAcpServer {
         );
         this.installSessionState(sessionState);
         this.recovery?.markLoaded(sessionState, openGeneration);
-        const lateAccountRead = knownAccount === "pending"
-            ? this.applyLateAccountRead(sessionState, authorization, authStatusVersionAtStart)
-            : null;
         subscribed = false;
 
         if (requestedMcpServers.length > 0 && mcpServerStartupVersion !== null) {
@@ -3181,12 +3216,16 @@ export class CodexAcpServer {
             sessionState: sessionState,
             settleTrackerReady: settleTrackerReady,
             awaitAccountRead: async () => {
-                if (lateAccountRead === null) return;
-                // A read that fails within the grace time rejects here, as it did before the replay.
-                if (await accountReadWithinGrace === "pending") return;
+                if (knownAccount !== "pending") return;
+                // A read that fails within the grace time rejects here, as it did before the replay. The load
+                // error is then the only answer, with no auth status push.
+                const accountWithinGrace = await accountReadWithinGrace;
+                const lateAccountRead = this.applyLateAccountRead(sessionState, authorization, authStatusVersionAtStart);
                 // The session gets the account of a read that ended within the grace time before the load answers.
-                await lateAccountRead;
+                // A read that did not end within it applies when it ends, after the load answered.
+                if (accountWithinGrace !== "pending") await lateAccountRead;
             },
+            sessionGeneration: requestedSessionGeneration,
         };
     }
 
@@ -4048,6 +4087,8 @@ export class CodexAcpServer {
      * message; a locally handled command has no Codex turn, so it is inserted right away.
      */
     async promptV2(params: acpV2.PromptRequest, signal?: AbortSignal): Promise<acpV2.PromptResponse> {
+        const pendingLoads = this.sessionLoads.whenIdle(params.sessionId);
+        if (pendingLoads) await pendingLoads;
         const sessionId = params.sessionId;
         const request = toV1PromptRequest(params);
         const sessionState = this.getSessionState(sessionId);
@@ -4250,6 +4291,9 @@ export class CodexAcpServer {
         // turn-start slot acquire their own reservation and pass it in; otherwise this call is
         // the v1 entry point and takes the session's turn-start slot itself.
         const ownsReservation = reservation === undefined;
+        // A caller with a reservation waited for the loads of the session before it took the reservation.
+        const pendingLoads = ownsReservation ? this.sessionLoads.whenIdle(params.sessionId) : null;
+        if (pendingLoads) await pendingLoads;
         const activeReservation = reservation ?? this.acquireTurnStartReservation(params.sessionId);
         if (activeReservation.needsWait) {
             await activeReservation.wait;

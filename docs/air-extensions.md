@@ -1346,6 +1346,13 @@ The adapter puts them in the notification `_meta`, next to `sessionId` and `upda
   Every replayed notification of the loaded session has it.
   The first one is the title of the session, when the replay sends a title.
 - `loadSessionEndOfRecordedHistory: true` is only on the last replayed notification, whatever its kind.
+- The end mark says that the recorded history arrived whole. It does not say that the load succeeded.
+  The load can still fail after the end mark, for example with `auth_required` when the account read ends.
+  The client handles that failure as for any other failed load.
+- The adapter sends no live turn event of the loaded session before the account wait of the load ends.
+  A load that fails sends no live turn event.
+- While a load of a session runs, the other opens and the prompts of that session wait until the load answers or fails.
+  So the replay of each load is whole, and has its own marks. A close of the session does not wait.
 - The adapter does not send `loadSessionReplaySize`. The history arrives in pages, so the size is not known in advance.
 - The adapter keeps the other keys of the notification `_meta`.
 - A replay with no notification sends no mark.
