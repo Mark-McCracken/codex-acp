@@ -1820,9 +1820,10 @@ export class CodexAcpServer {
                 this.pendingTurnStarts.delete(params.sessionId);
                 this.activePrompts.delete(params.sessionId);
                 this.turnStartQueueTail.delete(params.sessionId);
-                this.waitingRequestCancellers.delete(params.sessionId);
                 this.steeringQueues.delete(params.sessionId);
             }
+            // A request can start to wait during the awaits above: drop it like the requests before them.
+            this.cancelWaitingRequests(params.sessionId);
             this.endSessionCloseFence(params.sessionId);
         }
 
@@ -3950,19 +3951,28 @@ export class CodexAcpServer {
             this.waitingRequestCancellers.set(sessionId, cancellers);
         }
         cancellers.add(canceller);
-        return () => cancellers!.delete(canceller);
+        return () => {
+            // Look the set up again: a cancel removes the set, and a later request makes a new one.
+            const current = this.waitingRequestCancellers.get(sessionId);
+            if (current?.delete(canceller) && current.size === 0) {
+                this.waitingRequestCancellers.delete(sessionId);
+            }
+        };
     }
 
-    /** Aborts every request of a session that still waits before its turn. */
+    /**
+     * Aborts every request of a session that still waits before its turn, and removes the entry of
+     * the session. A request that starts waiting later registers in a new entry.
+     */
     private cancelWaitingRequests(sessionId: string): void {
         const cancellers = this.waitingRequestCancellers.get(sessionId);
         if (!cancellers) {
             return;
         }
+        this.waitingRequestCancellers.delete(sessionId);
         for (const canceller of cancellers) {
             canceller();
         }
-        cancellers.clear();
     }
 
     private async interruptPromptTurn(

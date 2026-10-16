@@ -338,6 +338,79 @@ describe("CodexACPAgent - loadSession auth", () => {
         expect(appServer.turnSteer).not.toHaveBeenCalled();
     });
 
+    it("drops a v2 prompt that starts to wait for the load during a close, and starts no turn after a reload", async () => {
+        const {fixture, agent, answer, load} = await startHeldLoad();
+        const appServer = fixture.getCodexAppServerClient();
+        const [unsubscribed, unsubscribe] = deferred<void>();
+        vi.spyOn(appServer, "threadUnsubscribe").mockImplementation(async () => {
+            await unsubscribed;
+            return {status: "unsubscribed"};
+        });
+        load.catch(() => {});
+
+        const close = agent.closeSession({sessionId: SESSION_ID});
+        await vi.waitFor(() => expect(appServer.threadUnsubscribe).toHaveBeenCalled());
+        let failure: unknown = null;
+        const prompt = agent.promptV2({sessionId: SESSION_ID, prompt: [{type: "text", text: "Run the tests"}]})
+            .catch(error => failure = error);
+        await settle();
+        unsubscribe();
+        await close;
+        await prompt;
+
+        expect(failure).toMatchObject({code: -32800});
+        expect(waitingRequestCancellers(agent).size).toBe(0);
+        answer(SIGNED_IN);
+        await load.catch(() => {});
+        await agent.loadSession({sessionId: SESSION_ID, cwd: "/test/project", mcpServers: []});
+        await agent.cancel({sessionId: SESSION_ID});
+        await settle();
+        expect(appServer.turnStart).not.toHaveBeenCalled();
+    });
+
+    it("answers cancelled to a v1 prompt that starts to wait for the load during a close, and starts no turn after a reload", async () => {
+        const {fixture, agent, answer, load} = await startHeldLoad();
+        const appServer = fixture.getCodexAppServerClient();
+        const [unsubscribed, unsubscribe] = deferred<void>();
+        vi.spyOn(appServer, "threadUnsubscribe").mockImplementation(async () => {
+            await unsubscribed;
+            return {status: "unsubscribed"};
+        });
+        load.catch(() => {});
+
+        const close = agent.closeSession({sessionId: SESSION_ID});
+        await vi.waitFor(() => expect(appServer.threadUnsubscribe).toHaveBeenCalled());
+        const prompt = agent.prompt({sessionId: SESSION_ID, prompt: [{type: "text", text: "Run the tests"}]});
+        await settle();
+        unsubscribe();
+        await close;
+
+        await expect(prompt).resolves.toMatchObject({stopReason: "cancelled"});
+        expect(waitingRequestCancellers(agent).size).toBe(0);
+        answer(SIGNED_IN);
+        await load.catch(() => {});
+        await agent.loadSession({sessionId: SESSION_ID, cwd: "/test/project", mcpServers: []});
+        await agent.cancel({sessionId: SESSION_ID});
+        await settle();
+        expect(appServer.turnStart).not.toHaveBeenCalled();
+    });
+
+    it("keeps no canceller entry for a session after its waiting requests end", async () => {
+        const {agent, answer, load} = await startHeldLoad();
+
+        const request = new AbortController();
+        const prompt = agent.promptV2({sessionId: SESSION_ID, prompt: [{type: "text", text: "Run the tests"}]}, request.signal)
+            .catch(() => {});
+        await settle();
+        expect(waitingRequestCancellers(agent).has(SESSION_ID)).toBe(true);
+        request.abort();
+        await prompt;
+
+        expect(waitingRequestCancellers(agent).size).toBe(0);
+        answer(SIGNED_IN);
+        await load;
+    });
+
     it("loads two sessions at the same time", async () => {
         const fixture = loadFixture();
         const appServer = fixture.getCodexAppServerClient();
@@ -433,4 +506,9 @@ function historyText(fixture: CodexMockTestFixture): string[] {
         .map(event => event.args[0].update)
         .filter(update => update.sessionUpdate === "agent_message_chunk")
         .map(update => update.content.text);
+}
+
+/** The per-session cancellers of the requests that wait before their turn. */
+function waitingRequestCancellers(agent: unknown): Map<string, Set<() => void>> {
+    return (agent as {waitingRequestCancellers: Map<string, Set<() => void>>}).waitingRequestCancellers;
 }
