@@ -6,6 +6,10 @@ import type {
 import type {ServerNotification} from "../app-server";
 import {isRootAgentPath} from "./CodexAgentPath";
 
+export type SubagentInteraction = <T>(
+    sessionId: string, itemId: string | undefined, request: () => Promise<T>, turnId?: string | null,
+) => Promise<T>;
+
 type Subscription = {
     rootSessionId: string;
     supportsSubagents: boolean;
@@ -15,6 +19,8 @@ type Subscription = {
     elicitationHandler: ElicitationHandler;
     waitForRootNotifications(): Promise<void>;
     waitForChildSession(childThreadId: string): Promise<string | null>;
+    withUserAction?: SubagentInteraction;
+    observeWorkEnd?: (event: ServerNotification) => void;
 };
 
 type SessionSubscription = {
@@ -41,6 +47,7 @@ export class CodexSubagentSubscriptions {
             // Register synchronously: app-server may emit child output directly
             // after the spawning collaboration item.
             this.discover(session, event);
+            session.current.observeWorkEnd?.(event);
             session.current.dispatch(event);
         });
         this.registerInteractiveHandlers(session, subscription.rootSessionId);
@@ -51,6 +58,12 @@ export class CodexSubagentSubscriptions {
             this.client.clearThreadHandlers(childSessionId);
         }
         this.sessions.delete(rootSessionId);
+    }
+
+    redispatch(rootSessionId: string, notifications: ServerNotification[]): void {
+        const session = this.sessions.get(rootSessionId);
+        if (!session) return;
+        for (const notification of notifications) session.current.dispatch(notification);
     }
 
     private discover(session: SessionSubscription, event: ServerNotification): void {
@@ -75,6 +88,7 @@ export class CodexSubagentSubscriptions {
                 const eventThreadId = (childEvent.params as {threadId?: unknown}).threadId;
                 if (eventThreadId !== childSessionId) return;
                 this.discover(session, childEvent);
+                session.current.observeWorkEnd?.(childEvent);
                 if (session.current.supportsSubagents) session.current.dispatch(childEvent);
                 else session.current.enqueueInteraction(this.rootAttributed(childEvent, session.current.rootSessionId));
             });
@@ -90,27 +104,24 @@ export class CodexSubagentSubscriptions {
                 await current.waitForRootNotifications();
                 const sessionId = await this.interactionSessionId(current, targetSessionId);
                 if (sessionId === null) return {decision: "cancel"};
-                return await current.approvalHandler.handleCommandExecution(
-                    {...params, threadId: sessionId},
-                );
+                const request = () => current.approvalHandler.handleCommandExecution({...params, threadId: sessionId});
+                return current.withUserAction ? current.withUserAction(sessionId, params.itemId, request, params.turnId) : request();
             },
             handleFileChange: async (params) => {
                 const current = session.current;
                 await current.waitForRootNotifications();
                 const sessionId = await this.interactionSessionId(current, targetSessionId);
                 if (sessionId === null) return {decision: "cancel"};
-                return await current.approvalHandler.handleFileChange(
-                    {...params, threadId: sessionId},
-                );
+                const request = () => current.approvalHandler.handleFileChange({...params, threadId: sessionId});
+                return current.withUserAction ? current.withUserAction(sessionId, params.itemId, request, params.turnId) : request();
             },
             handlePermissionsRequest: async (params) => {
                 const current = session.current;
                 await current.waitForRootNotifications();
                 const sessionId = await this.interactionSessionId(current, targetSessionId);
                 if (sessionId === null) return {permissions: {}, scope: "turn", strictAutoReview: false};
-                return await current.approvalHandler.handlePermissionsRequest(
-                    {...params, threadId: sessionId},
-                );
+                const request = () => current.approvalHandler.handlePermissionsRequest({...params, threadId: sessionId});
+                return current.withUserAction ? current.withUserAction(sessionId, params.itemId, request, params.turnId) : request();
             },
         });
         this.client.onElicitationRequest(targetSessionId, {
@@ -119,18 +130,16 @@ export class CodexSubagentSubscriptions {
                 await current.waitForRootNotifications();
                 const sessionId = await this.interactionSessionId(current, targetSessionId);
                 if (sessionId === null) return {action: "cancel", content: null, _meta: null};
-                return await current.elicitationHandler.handleElicitation(
-                    {...params, threadId: sessionId},
-                );
+                const request = () => current.elicitationHandler.handleElicitation({...params, threadId: sessionId});
+                return current.withUserAction ? current.withUserAction(sessionId, undefined, request, params.turnId) : request();
             },
             handleUserInput: async (params) => {
                 const current = session.current;
                 await current.waitForRootNotifications();
                 const sessionId = await this.interactionSessionId(current, targetSessionId);
                 if (sessionId === null) return {answers: {}};
-                return await current.elicitationHandler.handleUserInput(
-                    {...params, threadId: sessionId},
-                );
+                const request = () => current.elicitationHandler.handleUserInput({...params, threadId: sessionId});
+                return current.withUserAction ? current.withUserAction(sessionId, params.itemId, request, params.turnId) : request();
             },
         });
     }

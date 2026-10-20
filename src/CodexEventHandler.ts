@@ -61,7 +61,8 @@ import {
     AIR_SESSION_FAILURE_KEY,
     JETBRAINS_META_KEY,
 } from "./AirExtension";
-import {CodexSubagentEventRouter} from "./subagents/CodexSubagentEventRouter";
+import type {SubagentEventRouter} from "./subagents/SubagentEventRouter";
+import {StandardSubagentEventRouter} from "./subagents/StandardSubagentEventRouter";
 import type {SubagentState} from "./subagents/AcpSubagents";
 import {mergeRateLimitSnapshot} from "./RateLimitsMap";
 import {AGENT_FILE_CHANGE_REPORT_MAX_DIFF_BYTES} from "./AgentFileChangeReport";
@@ -239,7 +240,7 @@ export class CodexEventHandler {
     /** The last root turn that ended, for subagent turns that outlive it. */
     private latestRootTurnId: string | null = null;
     private readonly collectTurnDiffs: boolean;
-    private readonly subagents: CodexSubagentEventRouter;
+    private readonly subagents: SubagentEventRouter;
     /** Connection-level `authStatus` sink; the app-server account push feeds it. */
     private readonly onAccountUpdated: ((notification: AccountUpdatedNotification) => void) | undefined;
 
@@ -248,7 +249,7 @@ export class CodexEventHandler {
         sessionState: SessionState,
         supportsTypedSessionFailures: boolean,
         sessionFailureEpoch: string,
-        subagents: CodexSubagentEventRouter,
+        subagents: SubagentEventRouter,
         onAccountUpdated: ((notification: AccountUpdatedNotification) => void) | undefined,
         collectTurnDiffs: boolean,
         private readonly supportsCompaction: boolean,
@@ -426,6 +427,9 @@ export class CodexEventHandler {
     }
 
     async handleNotification(notification: ServerNotification) {
+        const threadId = (notification.params as {threadId?: unknown}).threadId;
+        if (this.subagents instanceof StandardSubagentEventRouter && this.subagents.isRetired()
+            && typeof threadId === "string" && threadId !== this.sessionState.sessionId) return;
         this.recordTerminalTurnError(notification);
         if (notification.method === "item/started"
             && notification.params.threadId === this.sessionState.sessionId
@@ -437,9 +441,21 @@ export class CodexEventHandler {
             this.recordChildTurnDiff(notification.params);
         }
         await this.flushPendingErrors();
+        if (this.subagents instanceof StandardSubagentEventRouter
+            && typeof threadId === "string" && threadId !== this.sessionState.sessionId
+            && !this.subagents.isNativeSubagentThread(threadId)) {
+            await this.subagents.handle(notification);
+            for (const event of this.subagents.takeBufferedNotifications()) await this.handleNotification(event);
+            return;
+        }
         await this.finishCompactionsForNotification(notification);
         const closingChildren = this.subagents.closingChildSessions(notification);
         for (const child of closingChildren) {
+            if (this.subagents instanceof StandardSubagentEventRouter) {
+                for (const update of this.subagents.openToolCalls(child.threadId)?.finishOutstanding() ?? []) {
+                    await this.session.update(update, child.sessionId);
+                }
+            }
             await this.finishOutstandingCompactions(
                 child.state === "cancelled" ? "cancelled" : "failed",
                 child.sessionId,
@@ -565,27 +581,27 @@ export class CodexEventHandler {
          */
         switch (notification.method) {
             case "item/agentMessage/delta":
-                this.completeRetryIncidentOnTurnProgress();
+                this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
                 return await this.createTextEvent(notification.params);
             case "item/plan/delta":
-                this.completeRetryIncidentOnTurnProgress();
+                this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
                 return this.plans.delta(notification.params.itemId, notification.params.delta);
             case "item/started": {
-                this.completeRetryIncidentOnTurnProgress();
+                this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
                 const update = await this.createItemEvent(notification.params);
-                this.trackOpenToolCall(notification.params.item);
+                this.trackOpenToolCall(notification.params.item, notification.params.threadId);
                 return update;
             }
             case "item/completed":
-                this.completeRetryIncidentOnTurnProgress();
-                this.sessionState.openToolCalls.complete(notification.params.item.id);
+                this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
+                this.openToolCalls(notification.params.threadId).complete(notification.params.item.id);
                 return await this.completeItemEvent(notification.params);
             case "turn/plan/updated":
-                this.completeRetryIncidentOnTurnProgress();
+                this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
                 return await this.updatePlan(notification.params);
             case "turn/diff/updated":
                 if (notification.params.threadId === this.sessionState.sessionId) {
-                    this.completeRetryIncidentOnTurnProgress();
+                    this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
                     if (!this.disposed && this.collectTurnDiffs) {
                         if (Buffer.byteLength(notification.params.diff, "utf8") > AGENT_FILE_CHANGE_REPORT_MAX_DIFF_BYTES) {
                             this.turnDiffs.delete(notification.params.turnId);
@@ -658,10 +674,10 @@ export class CodexEventHandler {
                     closed: true,
                 });
             case "item/commandExecution/outputDelta":
-                this.completeRetryIncidentOnTurnProgress();
+                this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
                 return this.renderer.render(this.commands.outputDelta(notification.params.itemId, notification.params.delta));
             case "item/mcpToolCall/progress":
-                this.completeRetryIncidentOnTurnProgress();
+                this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
                 // AIR does not show MCP progress.
                 if (this.renderer.capabilities.airToolCallContract) return null;
                 return this.renderer.render(McpToolReporter.progress(
@@ -693,13 +709,13 @@ export class CodexEventHandler {
                     )
                     : this.createContextCompactedEvent();
             case "item/reasoning/summaryTextDelta":
-                this.completeRetryIncidentOnTurnProgress();
+                this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
                 return this.createReasoningDeltaEvent(notification.params);
             case "item/reasoning/textDelta":
-                this.completeRetryIncidentOnTurnProgress();
+                this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
                 return this.createReasoningDeltaEvent(notification.params);
             case "item/reasoning/summaryPartAdded":
-                this.completeRetryIncidentOnTurnProgress();
+                this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
                 return this.createReasoningSectionBreakEvent(notification.params);
             case "model/rerouted":
                 return this.createModelReroutedEvent(notification.params);
@@ -1012,10 +1028,16 @@ export class CodexEventHandler {
         );
     }
 
-    private trackOpenToolCall(item: ThreadItem): void {
+    private openToolCalls(threadId: string) {
+        return this.subagents instanceof StandardSubagentEventRouter
+            ? this.subagents.openToolCalls(threadId) ?? this.sessionState.openToolCalls
+            : this.sessionState.openToolCalls;
+    }
+
+    private trackOpenToolCall(item: ThreadItem, threadId: string): void {
         if (!PLAIN_TOOL_CALL_ITEM_TYPES.has(item.type)) return;
         const hasTerminal = item.type === "commandExecution" && commandUsesTerminal(item);
-        this.sessionState.openToolCalls.start(item.id, hasTerminal);
+        this.openToolCalls(threadId).start(item.id, hasTerminal);
     }
 
     private async updatePlan(event: TurnPlanUpdatedNotification): Promise<UpdateSessionEvent> {
@@ -1144,7 +1166,8 @@ export class CodexEventHandler {
      * a new incident instead of overwriting the historical reconnect entry. Terminal errors remain active so
      * duplicate late notifications cannot append duplicate transcript rows.
      */
-    private completeRetryIncidentOnTurnProgress(): void {
+    private completeRetryIncidentOnTurnProgress(threadId: string): void {
+        if (this.subagents instanceof StandardSubagentEventRouter && threadId !== this.sessionState.sessionId) return;
         const turnId = this.sessionState.currentTurnId;
         if (turnId === null) return;
         const activeId = this.activeFailureIdByScope.get(turnId);

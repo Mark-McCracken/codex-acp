@@ -18,6 +18,8 @@ export interface MockResponsesServer {
     enqueue(...responses: string[]): void;
     /** Keeps returning the HTTP error across runtime retries, until cleared with null. */
     setErrorResponse(response: MockErrorResponse | null): void;
+    /** Selects replies by request instead of arrival order, for concurrent root/child/title calls. */
+    setResponseHandler(handler: (request: unknown) => string | undefined): void;
     close(): Promise<void>;
 }
 
@@ -33,6 +35,7 @@ function parseBody(body: string): unknown {
 export async function startMockResponsesServer(): Promise<MockResponsesServer> {
     const queue: string[] = [];
     let errorResponse: MockErrorResponse | null = null;
+    let responseHandler: ((request: unknown) => string | undefined) | undefined;
     const requests: unknown[] = [];
     let unexpectedRequests = 0;
     let requestCount = 0;
@@ -42,9 +45,10 @@ export async function startMockResponsesServer(): Promise<MockResponsesServer> {
         req.on("data", (chunk) => body += chunk);
         req.on("end", () => {
             requestCount++;
-            requests.push(parseBody(body));
+            const parsed = parseBody(body);
+            requests.push(parsed);
             const isResponsesCall = req.method === "POST" && (req.url ?? "").split("?")[0]!.endsWith("/responses");
-            const next = isResponsesCall ? errorResponse ?? queue.shift() : undefined;
+            const next = isResponsesCall ? errorResponse ?? (responseHandler ? responseHandler(parsed) : queue.shift()) : undefined;
             if (next === undefined) {
                 unexpectedRequests++;
                 res.writeHead(isResponsesCall ? 400 : 404);
@@ -76,6 +80,7 @@ export async function startMockResponsesServer(): Promise<MockResponsesServer> {
             queue.push(...responses);
         },
         setErrorResponse: response => { errorResponse = response; },
+        setResponseHandler: handler => { responseHandler = handler; },
         close: async () => {
             server.closeAllConnections();
             await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -121,8 +126,13 @@ export function textResponse(...chunks: string[]): string {
 
 /** The model calls the shell tool `exec_command` with `args` (e.g. `{cmd: "echo hi"}`). */
 export function execCommandResponse(callId: string, args: object): string {
+    return functionCallResponse(callId, "exec_command", args);
+}
+
+export function functionCallResponse(callId: string, name: string, args: object, namespace?: string): string {
     return wrap(nextId(), [
-        {type: "response.output_item.done", output_index: 0, item: {type: "function_call", id: `fc_${callId}`, call_id: callId, name: "exec_command", arguments: JSON.stringify(args)}},
+        {type: "response.output_item.done", output_index: 0, item: {type: "function_call", id: `fc_${callId}`, call_id: callId, name,
+            ...(namespace ? {namespace} : {}), arguments: JSON.stringify(args)}},
     ]);
 }
 

@@ -1,7 +1,7 @@
 import type * as acpV2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {logger} from "./Logger";
 
-type Activity = "idle" | "running" | "requires_action";
+type Activity = "idle" | "running" | "requires_action" | "unknown";
 
 /** Session state and its wire order are independent of prompt acceptance and individual requests. */
 export class AcpV2ForegroundState {
@@ -12,17 +12,17 @@ export class AcpV2ForegroundState {
 
     constructor(
         private readonly notify: (state: acpV2.StateUpdate) => Promise<void>,
-        running = false,
+        running: boolean | "unknown" = false,
     ) {
-        this.activity = running ? "running" : "idle";
+        this.activity = running === "unknown" ? "unknown" : running ? "running" : "idle";
     }
 
     async update(state: acpV2.StateUpdate): Promise<void> {
-        if (state.state === "idle") {
+        if (state.state === "idle" || state.state === "unknown") {
             this.items.clear();
             this.actions.clear();
-            if (this.activity === "idle") return this.sending;
-            this.activity = "idle";
+            if (this.activity === state.state) return this.sending;
+            this.activity = state.state;
         } else if (state.state === "running" || state.state === "requires_action") {
             if (this.activity === state.state) return this.sending;
             this.activity = state.state;
@@ -44,6 +44,8 @@ export class AcpV2ForegroundState {
                 return this.publish({state: "running"});
             case "requires_action":
                 return this.publish({state: "requires_action"});
+            case "unknown":
+                return this.publish({state: "unknown"});
         }
     }
 
@@ -75,6 +77,12 @@ export class AcpV2ForegroundState {
 
     dispose(): void {
         this.activity = "idle";
+        this.items.clear();
+        this.actions.clear();
+    }
+
+    invalidate(): void {
+        this.activity = "unknown";
         this.items.clear();
         this.actions.clear();
     }

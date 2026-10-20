@@ -826,6 +826,16 @@ export class CodexAcpClient {
         return null;
     }
 
+    /** A standard child is one conversation, not one synthetic session per delegation. */
+    async readSessionItems(sessionId: string): Promise<AsyncIterable<ThreadItem[]>> {
+        const metadata = await this.codexClient.threadRead({threadId: sessionId});
+        if (metadata.thread.historyMode === "legacy") {
+            const legacy = await this.codexClient.threadRead({threadId: sessionId, includeTurns: true});
+            return oneItemPage(legacy.thread.turns.flatMap(turn => turn.items));
+        }
+        return this.codexClient.threadItemPages(sessionId);
+    }
+
     async newSession(request: WithAcpMcpServers<acp.NewSessionRequest>): Promise<SessionMetadata> {
         const instructions = await this.resolveSessionInstructions(request, undefined, true);
         const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);
@@ -1235,6 +1245,8 @@ export class CodexAcpClient {
         supportsSubagents: boolean,
         observeInteraction: (result: ServerNotification) => void | Promise<void>,
         waitForChildSession: (childThreadId: string) => Promise<string | null>,
+        withUserAction?: import("./subagents/CodexSubagentSubscriptions").SubagentInteraction,
+        observeWorkEnd?: (event: ServerNotification) => void,
     ) {
         const dispatch = (event: ServerNotification) => {
             this.enqueueSessionNotification(sessionId, () => eventHandler(event));
@@ -1253,7 +1265,16 @@ export class CodexAcpClient {
             elicitationHandler,
             waitForRootNotifications: () => this.waitForSessionNotifications(sessionId),
             waitForChildSession,
+            ...(withUserAction ? {withUserAction} : {}),
+            ...(observeWorkEnd ? {observeWorkEnd} : {}),
         });
+    }
+
+    redispatchSessionNotifications(
+        sessionId: string, notifications: ServerNotification[], after?: () => Promise<void>,
+    ): void {
+        this.subagents.redispatch(sessionId, notifications);
+        if (after) this.enqueueSessionNotification(sessionId, after);
     }
 
     async waitForSessionNotifications(sessionId: string): Promise<void> {
