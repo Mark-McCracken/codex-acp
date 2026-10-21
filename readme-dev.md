@@ -209,8 +209,10 @@ Responding to child-scoped Agent-to-Client requests is still allowed. Replayed a
 transcripts do not grant controls or confirm current activity; overlapping completed items are
 deduplicated and fresh work snapshots follow the replay response. A copied history alone never
 authorizes interrupting the original child runtime.
-Load/resume requests for the same standard parent are serialized through this response boundary;
-close and cancel remain independent, and a close invalidates already queued setups.
+Load/resume attachment operations for the same standard parent are serialized. Fresh child
+traffic follows the actual response write, including when the response is part of a batch;
+overlapping attachments publish after the latest setup's response rather than interleaving
+with its replay. Close and cancel remain independent, and a close invalidates queued setups.
 
 Dedicated `session_message` reporting and optional child controls remain follow-ups. Ordinary
 runtime tool reports remain available for operations such as waiting and follow-up tasks.

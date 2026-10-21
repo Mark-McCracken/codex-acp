@@ -4,6 +4,7 @@ import {z} from "zod";
 import type {CodexAcpServer} from "./CodexAcpServer";
 import {type AcpClientConnection, AcpV2Connection} from "./ACPSessionConnection";
 import packageJson from "../package.json";
+import {AcpResponseDelivery} from "./AcpResponseDelivery";
 import {
     GOAL_CONTROL_METHOD, LEGACY_SET_SESSION_MODEL_METHOD,
     SESSION_STEERING_METHOD,
@@ -65,6 +66,20 @@ const hooksTrustParamsParser = z.object({
  */
 export function createAcpAgentRouter(
     createAgent: (connection: AcpClientConnection | AcpV2Connection) => CodexAcpServer,
+): Pick<acpV2.AgentProtocolRouter, "connect"> {
+    return {
+        connect(stream, options) {
+            const responses = new AcpResponseDelivery();
+            const connection = createRouter(createAgent, responses).connect(responses.observe(stream), options);
+            void connection.closed.then(() => responses.dispose());
+            return connection;
+        },
+    };
+}
+
+function createRouter(
+    createAgent: (connection: AcpClientConnection | AcpV2Connection) => CodexAcpServer,
+    responses: AcpResponseDelivery,
 ): acpV2.AgentProtocolRouter {
     let codexAcpServer: CodexAcpServer | null = null;
     const getAgent = (params?: {sessionId?: unknown}): CodexAcpServer => {
@@ -74,34 +89,52 @@ export function createAcpAgentRouter(
         if (typeof params?.sessionId === "string") codexAcpServer.assertSessionMutationAllowed(params.sessionId);
         return codexAcpServer;
     };
-    const setupTails = new Map<string, Promise<void>>();
-    const setup = <T>(sessionId: string, operation: () => Promise<T>, signal: AbortSignal): Promise<T> => {
-        const agent = getAgent();
+    type SetupState = {tail: Promise<void>; publication: Promise<void>; epoch: number; pending: number};
+    const setups = new Map<string, SetupState>();
+    const setup = <T>(sessionId: string, requestId: acpV2.JsonRpcId, operation: () => Promise<T>, signal: AbortSignal): Promise<T> => {
+        const agent = getAgent({sessionId});
         if (!agent.usesStandardSubagents()) return operation();
         const assertCurrent = agent.captureSessionSetup(sessionId);
+        const state = setups.get(sessionId) ?? {tail: Promise.resolve(), publication: Promise.resolve(), epoch: 0, pending: 0};
+        setups.set(sessionId, state);
+        state.pending++;
+        const finish = () => {
+            if (--state.pending === 0 && setups.get(sessionId) === state) setups.delete(sessionId);
+        };
         let resolve!: (response: T) => void;
         let reject!: (error: unknown) => void;
         const response = new Promise<T>((done, failed) => { resolve = done; reject = failed; });
-        // A following setup must not consume the previous setup's deferred child traffic.
-        const task = (setupTails.get(sessionId) ?? Promise.resolve()).catch(() => {}).then(async () => {
+        const task = state.tail.catch(() => {}).then(async () => {
+            let registered = false;
             try {
+                // A publication may start while this task is yielding to an earlier resolved promise.
+                for (;;) {
+                    const publication = state.publication;
+                    await publication;
+                    if (publication === state.publication) break;
+                }
                 if (signal.aborted) throw new acp.RequestError(-32800, "Session setup was cancelled");
                 assertCurrent();
+                const epoch = ++state.epoch;
+                responses.afterWrite(requestId, () => {
+                    if (epoch === state.epoch) state.publication = agent.afterSessionSetupResponse(sessionId);
+                    void state.publication.then(finish, finish);
+                });
+                registered = true;
                 resolve(await operation());
             } catch (error) {
                 reject(error);
+                if (!registered) finish();
             }
-            await agent.afterSessionSetupResponse(sessionId);
         });
-        setupTails.set(sessionId, task);
-        void task.finally(() => {
-            if (setupTails.get(sessionId) === task) setupTails.delete(sessionId);
-        }).catch(() => {});
+        // Do not wait for delivery here: two requests in one batch share a response write.
+        state.tail = task;
         return response;
     };
     const attachAgent = (agent: CodexAcpServer, signal: AbortSignal) => {
         codexAcpServer = agent;
         signal.addEventListener("abort", () => {
+            setups.clear();
             agent.sessionIndex.dispose();
             if (codexAcpServer === agent) {
                 codexAcpServer = null;
@@ -113,11 +146,11 @@ export function createAcpAgentRouter(
         .onConnect((connection) => attachAgent(createAgent(connection.client), connection.signal))
         .onRequest(acp.methods.agent.initialize, (ctx) => getAgent().initialize(ctx.params))
         .onRequest(acp.methods.agent.session.new, (ctx) => getAgent().newSession(ctx.params))
-        .onRequest(acp.methods.agent.session.load, (ctx) => setup(ctx.params.sessionId, () => getAgent(ctx.params).loadSession(ctx.params), ctx.signal))
+        .onRequest(acp.methods.agent.session.load, (ctx) => setup(ctx.params.sessionId, ctx.requestId, () => getAgent(ctx.params).loadSession(ctx.params), ctx.signal))
         .onRequest(acp.methods.agent.session.fork, (ctx) => getAgent(ctx.params).forkSession(ctx.params))
         .onRequest(acp.methods.agent.session.list, (ctx) => getAgent().listSessions(ctx.params))
         .onRequest(acp.methods.agent.session.delete, (ctx) => getAgent(ctx.params).deleteSession(ctx.params))
-        .onRequest(acp.methods.agent.session.resume, (ctx) => setup(ctx.params.sessionId, () => getAgent(ctx.params).resumeSession(ctx.params), ctx.signal))
+        .onRequest(acp.methods.agent.session.resume, (ctx) => setup(ctx.params.sessionId, ctx.requestId, () => getAgent(ctx.params).resumeSession(ctx.params), ctx.signal))
         .onRequest(acp.methods.agent.session.close, (ctx) => getAgent(ctx.params).closeSession(ctx.params))
         .onRequest(acp.methods.agent.session.setMode, (ctx) => getAgent(ctx.params).setSessionMode(ctx.params))
         .onRequest(acp.methods.agent.session.setConfigOption, (ctx) => getAgent(ctx.params).setSessionConfigOption(ctx.params))
@@ -149,7 +182,7 @@ export function createAcpAgentRouter(
         .onRequest(acpV2.methods.agent.session.new, (ctx) => getAgent().newSessionV2(ctx.params))
         .onRequest(acpV2.methods.agent.session.list, (ctx) => getAgent().listSessions(ctx.params))
         .onRequest(acpV2.methods.agent.session.delete, (ctx) => getAgent(ctx.params).deleteSession(ctx.params))
-        .onRequest(acpV2.methods.agent.session.resume, (ctx) => setup(ctx.params.sessionId, () => getAgent(ctx.params).resumeSessionV2(ctx.params), ctx.signal))
+        .onRequest(acpV2.methods.agent.session.resume, (ctx) => setup(ctx.params.sessionId, ctx.requestId, () => getAgent(ctx.params).resumeSessionV2(ctx.params), ctx.signal))
         .onRequest(acpV2.methods.agent.session.fork, (ctx) => getAgent(ctx.params).forkSessionV2(ctx.params))
         .onRequest(acpV2.methods.agent.session.close, (ctx) => getAgent(ctx.params).closeSession(ctx.params))
         // No `session/set_mode`: v2 removed the modes API; modes are config options.

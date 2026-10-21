@@ -1,5 +1,6 @@
 import {afterEach, describe, expect, it, vi} from "vitest";
 import type {ClientCapabilities} from "@agentclientprotocol/sdk/unstable";
+import type {AnyWireMessage} from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type {ServerNotification} from "../../app-server";
 import type {ThreadItem} from "../../app-server/v2";
 import {SubagentAssociations} from "../../subagents/SubagentAssociations";
@@ -42,6 +43,14 @@ function hasText(update: PromptSession["scopedUpdates"][number]["update"], text:
     const content = "content" in update ? update.content : null;
     return update.sessionUpdate === "agent_message_chunk" && typeof content === "object" && content !== null
         && "type" in content && content.type === "text" && "text" in content && content.text === text;
+}
+
+function childStateFrame(frame: AnyWireMessage): boolean {
+    return (Array.isArray(frame) ? frame : [frame]).some(entry => {
+        if (!("method" in entry) || entry.method !== "session/update") return false;
+        const params = entry.params as {sessionId: string; update: {sessionUpdate: string}};
+        return params.sessionId === childId && params.update.sessionUpdate === "state_update";
+    });
 }
 
 function history(h: PromptSession, rootItems: ThreadItem[], childTurns: ThreadItem[][], onRead?: () => void | Promise<void>) {
@@ -115,6 +124,106 @@ describe.each([1, 2] as const)("ACP v%s standard child sessions", version => {
         await prompt;
         await h.promptRunFinished();
     }
+
+    async function finishTitle(h: PromptSession) {
+        await vi.waitFor(() => expect(h.appServer["pendingTurnCompletionResolvers"].get(titleThreadId)?.has("title-turn")).toBe(true));
+        h.emit(onThread(turnCompleted("title-turn"), titleThreadId));
+    }
+
+    it.each(version === 1 ? ["session/load", "session/resume"] : ["session/resume"])(
+        "keeps new child permissions and form elicitation routable after %s", async method => {
+            const h = await connect({
+                v1ClientCapabilities: {...capabilities, elicitation: {form: {}}},
+                clientCapabilities: {elicitation: {form: {}}},
+                onRequestPermission: async request => ({outcome: {outcome: "selected", optionId: request.options[0]!.optionId}}),
+                onElicitation: async () => ({action: "decline"}),
+            });
+            await delegate(h);
+            const approval = (itemId: string) => h.triggerApproval("item/commandExecution/requestApproval", {
+                threadId: child, turnId: "child-first", itemId,
+                command: "echo hello", cwd, commandActions: [], reason: null, availableDecisions: ["accept", "decline"],
+            });
+            expect(await approval("before-replay")).toEqual({decision: "accept"});
+            await finishTitle(h);
+            history(h, [], [[]]);
+            await h.request(method, {sessionId, cwd, mcpServers: [], ...(version === 2 ? {replayFrom: {type: "start"}} : {})});
+            expect(await approval("after-replay")).toEqual({decision: "accept"});
+            expect(await h.triggerApproval("item/tool/requestUserInput", {
+                threadId: child, turnId: "child-first", itemId: "after-replay-question", autoResolutionMs: null,
+                questions: [{id: "question", header: "Question", question: "Choose", isOther: false, isSecret: false,
+                    options: [{label: "A", description: "Pick A"}]}],
+            })).toEqual({answers: {}});
+            const requests = h.transcript.flatMap(entry => "permissionRequest" in entry ? [entry.permissionRequest.sessionId]
+                : "elicitationRequest" in entry && "sessionId" in entry.elicitationRequest ? [entry.elicitationRequest.sessionId] : []);
+            expect(requests).toEqual([childId, childId, childId]);
+        },
+    );
+
+    it("retains accepted child URL elicitation completions across parent replay and a later prompt", async () => {
+        const h = await connect({
+            v1ClientCapabilities: {...capabilities, elicitation: {url: {}}},
+            clientCapabilities: {elicitation: {url: {}}},
+            onElicitation: async () => ({action: "accept", content: null}),
+        });
+        await delegate(h);
+        await finishTitle(h);
+        history(h, [], [[]]);
+        for (const transition of ["replay", "prompt"] as const) {
+            const elicitationId = `child-url-${transition}`;
+            expect(await h.triggerApproval("mcpServer/elicitation/request", {
+                threadId: child, turnId: "child-first", serverName: "auth", mode: "url", _meta: null,
+                message: "Authorize", url: "https://example.com/authorize", elicitationId,
+            })).toMatchObject({action: "accept"});
+            if (transition === "replay") {
+                await h.request(version === 1 ? "session/load" : "session/resume", {
+                    sessionId, cwd, mcpServers: [], ...(version === 2 ? {replayFrom: {type: "start"}} : {}),
+                });
+            } else {
+                const prompt = h.sendPrompt([{type: "text", text: "Continue"}]);
+                await vi.waitFor(() => expect(h.turnStartParams).toHaveLength(2));
+                h.emit(turnStarted("turn-2"));
+                const id = h.turnStartParams[1]!["clientUserMessageId"];
+                h.emit(itemStarted(userMessageItem(typeof id === "string" ? id : null, "Continue"), "turn-2"));
+                h.emit(turnCompleted("turn-2"));
+                await prompt;
+                await h.promptRunFinished(1);
+            }
+            h.emit({method: "serverRequest/resolved", params: {threadId: child, requestId: `request-${transition}`}});
+            await flush(h);
+            expect(h.transcript.filter(entry => "elicitationComplete" in entry)).toContainEqual({
+                elicitationComplete: {elicitationId},
+            });
+        }
+    });
+
+    it("reannounces ancestors before an existing nested child's metadata during replay", async () => {
+        const h = await connect();
+        h.emit(activity("coordinator", "/root/coordinator"));
+        h.emit(activity(child, "/root/coordinator/worker"));
+        await flush(h);
+        const start = h.scopedUpdates.length;
+        history(h, [], [[]]);
+        h.setCodexResponse("thread/read", async params => {
+            const {threadId, includeTurns} = params as {threadId: string; includeTurns?: boolean};
+            if (threadId === sessionId && includeTurns) {
+                h.emit(activity(child, "/root/coordinator/renamed"));
+            }
+            return {thread: {...createThread(), id: threadId, sessionId: threadId, turns: []}};
+        });
+        await h.request(version === 1 ? "session/load" : "session/resume", {
+            sessionId, cwd, mcpServers: [], ...(version === 2 ? {replayFrom: {type: "start"}} : {}),
+        });
+        await flush(h);
+        const known = new Set([sessionId]);
+        const updates = h.scopedUpdates.slice(start);
+        for (const entry of updates) {
+            expect(known.has(entry.sessionId), `unknown scope ${entry.sessionId}`).toBe(true);
+            if (entry.update.sessionUpdate === "subagent_update" && typeof entry.update.sessionId === "string") {
+                known.add(entry.update.sessionId);
+            }
+        }
+        expect(updates.some(({update}) => update.sessionUpdate === "subagent_update" && update.title === "Renamed")).toBe(true);
+    });
 
     it("announces once and keeps the same identity across idle and later work", async () => {
         const h = await connect();
@@ -393,20 +502,86 @@ describe.each([1, 2] as const)("ACP v%s standard child sessions", version => {
         expect(roster.map(({sessionId}) => sessionId)).toEqual([sessionId, "fork"]);
     });
 
-    it("serializes same-parent replay through the preceding response and live-traffic boundary", async () => {
+    it.skipIf(version !== 2).each([false, true])(
+        "holds fresh child snapshots until a delayed response batch is written (list fails: %s)", async fails => {
+            const h = await connect();
+            h.emit(activity());
+            h.emit(onThread(turnStarted("child-first"), child));
+            await flush(h);
+            history(h, [], [[]]);
+            let release!: () => void;
+            const held = new Promise<void>(resolve => { release = resolve; });
+            const list = vi.spyOn(h.agent, "listSessions").mockImplementationOnce(async () => {
+                await held;
+                if (fails) throw new Error("Delayed list failure");
+                return {sessions: []};
+            });
+            const resume = vi.spyOn(h.agent, "resumeSessionV2");
+            const start = h.wireMessages.length;
+            const batch = h.requestBatch([
+                {method: "session/resume", params: {sessionId, cwd, replayFrom: {type: "start"}}},
+                {method: "session/list", params: {}},
+            ]);
+            batch.catch(() => {});
+            try {
+                await vi.waitFor(() => expect(resume.mock.results).toHaveLength(1));
+                await resume.mock.results[0]!.value;
+                expect(list).toHaveBeenCalledTimes(1);
+                // Exercise the old next-turn release while the SDK still withholds the batch.
+                await new Promise<void>(resolve => setImmediate(resolve));
+                await flush(h);
+                expect(h.wireMessages.slice(start).some(Array.isArray)).toBe(false);
+                expect(h.wireMessages.slice(start).some(childStateFrame)).toBe(false);
+            } finally {
+                release();
+            }
+            if (fails) await expect(batch).rejects.toMatchObject({code: -32603});
+            else await batch;
+            await vi.waitFor(() => expect(h.wireMessages.slice(start).some(childStateFrame)).toBe(true));
+            const frames = h.wireMessages.slice(start);
+            const boundary = frames.findIndex(Array.isArray);
+            expect(boundary).toBeGreaterThanOrEqual(0);
+            expect(frames.findIndex(childStateFrame)).toBeGreaterThan(boundary);
+        },
+    );
+
+    it.skipIf(version !== 2)("completes two same-parent replays in one batch without losing live traffic", async () => {
+        const h = await connect();
+        h.emit(activity());
+        h.emit(onThread(turnStarted("child-first"), child));
+        await flush(h);
+        let reads = 0;
+        history(h, [{type: "subAgentActivity", id: "started", kind: "started", agentThreadId: child, agentPath: "/root/worker"}],
+            [[]], () => {
+                if (++reads === 1) {
+                    h.emit(onThread(agentMessageDelta("Live across batch", "child-first", "batch-message"), child));
+                }
+            });
+        const start = h.wireMessages.length;
+        await h.requestBatch([
+            {method: "session/resume", params: {sessionId, cwd, replayFrom: {type: "start"}}},
+            {method: "session/resume", params: {sessionId, cwd, replayFrom: {type: "start"}}},
+        ]);
+        expect(reads).toBe(2);
+        await vi.waitFor(() => expect(h.wireMessages.slice(start).some(childStateFrame)).toBe(true));
+        await flush(h);
+        const frames = h.wireMessages.slice(start);
+        expect(frames.findIndex(childStateFrame)).toBeGreaterThan(frames.findIndex(Array.isArray));
+        expect(childUpdates(h).filter(({update}) => hasText(update, "Live across batch"))).toHaveLength(1);
+    });
+
+    it("serializes same-parent attachments without losing deferred live traffic", async () => {
         const h = await connect();
         let release!: () => void;
         const held = new Promise<void>(resolve => { release = resolve; });
         let reads = 0;
-        let firstResponded = false;
         history(h, [{type: "subAgentActivity", id: "started", kind: "started", agentThreadId: child, agentPath: "/root/worker"}], [[]], async () => {
             reads++;
             if (reads === 1) await held;
-            else expect(firstResponded).toBe(true);
         });
         const params = {sessionId, cwd, mcpServers: [], ...(version === 2 ? {replayFrom: {type: "start"}} : {})};
         const method = version === 1 ? "session/load" : "session/resume";
-        const first = h.request(method, params).then(() => { firstResponded = true; });
+        const first = h.request(method, params);
         await vi.waitFor(() => expect(reads).toBe(1));
         const second = h.request(method, params);
         await h.request("session/list", {});
@@ -418,6 +593,7 @@ describe.each([1, 2] as const)("ACP v%s standard child sessions", version => {
         release();
         await first;
         await second;
+        await vi.waitFor(() => expect(childUpdates(h).some(({update}) => hasText(update, "Live result"))).toBe(true));
         await flush(h);
         expect(reads).toBe(2);
         expect(childUpdates(h).filter(({update}) => hasText(update, "Live result"))).toHaveLength(1);

@@ -52,6 +52,7 @@ export class StandardSubagentEventRouter implements SubagentEventRouter {
     private retired = false;
     private snapshotting = false;
     private readonly snapshots = new Map<string, {child: Child; state: StateUpdate}>();
+    private interactionObserver?: (event: ServerNotification, sessionId: string) => Promise<void>;
 
     constructor(
         private readonly rootSessionId: string,
@@ -109,6 +110,7 @@ export class StandardSubagentEventRouter implements SubagentEventRouter {
                 if (isRootAgentPath(item.agentPath)) return true;
                 const child = this.children.get(item.agentThreadId);
                 if (child) {
+                    await this.ensureAnnounced(child);
                     child.path = normalizeAgentPath(item.agentPath);
                     const title = nameFromAgentPath(item.agentPath, child.title ?? "Agent");
                     if (title !== child.title) {
@@ -126,6 +128,7 @@ export class StandardSubagentEventRouter implements SubagentEventRouter {
         if (!child) return false;
         await this.ensureAnnounced(child);
         if (this.retired) return true;
+        await this.interactionObserver?.(notification, child.sessionId);
         child.live = true;
         const progressTurnId = (notification.params as {turnId?: string}).turnId;
         const modelProgress = notification.method === "item/agentMessage/delta"
@@ -444,6 +447,10 @@ export class StandardSubagentEventRouter implements SubagentEventRouter {
     activeTurns(): Array<{threadId: string; turnId: string | null}> {
         return [...this.children.values()].filter(child => child.live)
             .map(child => ({threadId: child.threadId, turnId: child.turnId}));
+    }
+
+    setInteractionObserver(observer: (event: ServerNotification, sessionId: string) => Promise<void>): void {
+        this.interactionObserver = observer;
     }
 
     isRetired(): boolean {

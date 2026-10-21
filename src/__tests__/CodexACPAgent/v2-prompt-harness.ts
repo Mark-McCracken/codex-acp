@@ -104,6 +104,8 @@ export type TranscriptEntry =
     | {elicitationComplete: acpV2.CompleteElicitationNotification};
 
 export type PromptSession = {
+    wireMessages: acpV2.AnyWireMessage[];
+    requestBatch(requests: Array<{method: string; params: unknown}>): Promise<unknown>;
     connection: {close(): void};
     transcript: TranscriptEntry[];
     scopedUpdates: Array<{sessionId: string; update: acpV2.SessionUpdate | acp.SessionUpdate}>;
@@ -158,6 +160,7 @@ export async function connectSession(protocolVersion: 1 | 2 = 2, options: {
 } = {}): Promise<PromptSession> {
     const mocks = createMockConnections();
     const transcript: TranscriptEntry[] = [];
+    const wireMessages: acpV2.AnyWireMessage[] = [];
     const scopedUpdates: PromptSession["scopedUpdates"] = [];
     const turnStartParams: Array<Record<string, unknown>> = [];
     const codexResponseOverrides = new Map<string, (params: unknown) => Promise<unknown>>(
@@ -212,10 +215,20 @@ export async function connectSession(protocolVersion: 1 | 2 = 2, options: {
             setupUpdates.push(update as acpV2.SessionUpdate);
         }
     };
-    const clientStream = acp.ndJsonStream(clientToAgent.writable, agentToClient.readable);
+    const stream = acpV2.ndJsonStream(clientToAgent.writable, agentToClient.readable);
+    const clientStream = {
+        writable: stream.writable,
+        readable: stream.readable.pipeThrough(new TransformStream<acpV2.AnyWireMessage, acpV2.AnyWireMessage>({
+            transform(message, controller) {
+                wireMessages.push(message);
+                controller.enqueue(message);
+            },
+        })),
+    };
     let connection: {close(): void};
     let request: (method: string, params: unknown, signal?: AbortSignal) => Promise<any>;
     let notifyCancel: () => Promise<void>;
+    let requestBatch: PromptSession["requestBatch"] = async () => { throw new Error("Batches require ACP v2"); };
     if (protocolVersion === 2) {
         const v2Connection = acpV2.client({name: "test-client"})
             .onNotification(acpV2.methods.client.session.update, (ctx) => onUpdate(ctx.params.update, ctx.params.sessionId))
@@ -244,6 +257,13 @@ export async function connectSession(protocolVersion: 1 | 2 = 2, options: {
         });
         await v2Connection.agent.request(acpV2.methods.agent.session.new, {cwd, ...(options.mcpServers ? {mcpServers: options.mcpServers} : {})});
         connection = v2Connection;
+        requestBatch = async requests => {
+            const [first, ...rest] = requests.map(({method, params}) => acpV2.batchRequest(
+                method as typeof acpV2.methods.agent.session.resume, params as acpV2.ResumeSessionRequest,
+            ));
+            if (!first) throw new Error("Empty request batch");
+            return v2Connection.agent.batch([first, ...rest]);
+        };
         request = (method, params, signal) => v2Connection.agent.request(
             method as typeof acpV2.methods.agent.session.prompt,
             params as acpV2.PromptRequest,
@@ -265,7 +285,10 @@ export async function connectSession(protocolVersion: 1 | 2 = 2, options: {
                 if (!options.onElicitation) throw new Error("No elicitation handler configured");
                 return await options.onElicitation(request, ctx.signal) as acp.CreateElicitationResponse;
             })
-            .connect(clientStream);
+            .onNotification(acp.methods.client.elicitation.complete, (ctx) => {
+                transcript.push({elicitationComplete: ctx.params});
+            })
+            .connect({...clientStream, readable: clientStream.readable as ReadableStream<acp.AnyMessage>});
         await v1Connection.agent.request(acp.methods.agent.initialize, {
             protocolVersion: acp.PROTOCOL_VERSION,
             ...(options.v1ClientCapabilities ? {clientCapabilities: options.v1ClientCapabilities} : {}),
@@ -307,6 +330,8 @@ export async function connectSession(protocolVersion: 1 | 2 = 2, options: {
     };
 
     return {
+        wireMessages,
+        requestBatch,
         connection,
         transcript,
         scopedUpdates,

@@ -2,6 +2,7 @@ import http from "node:http";
 import type {AddressInfo} from "node:net";
 
 type MockErrorResponse = {status: number; body: unknown};
+type ResponseHandler = (request: unknown) => string | undefined | Promise<string | undefined>;
 
 /**
  * Local stand-in for the OpenAI Responses API. Each `POST /v1/responses` from Codex gets the next queued reply;
@@ -19,7 +20,7 @@ export interface MockResponsesServer {
     /** Keeps returning the HTTP error across runtime retries, until cleared with null. */
     setErrorResponse(response: MockErrorResponse | null): void;
     /** Selects replies by request instead of arrival order, for concurrent root/child/title calls. */
-    setResponseHandler(handler: (request: unknown) => string | undefined): void;
+    setResponseHandler(handler: ResponseHandler): void;
     close(): Promise<void>;
 }
 
@@ -35,7 +36,7 @@ function parseBody(body: string): unknown {
 export async function startMockResponsesServer(): Promise<MockResponsesServer> {
     const queue: string[] = [];
     let errorResponse: MockErrorResponse | null = null;
-    let responseHandler: ((request: unknown) => string | undefined) | undefined;
+    let responseHandler: ResponseHandler | undefined;
     const requests: unknown[] = [];
     let unexpectedRequests = 0;
     let requestCount = 0;
@@ -43,12 +44,20 @@ export async function startMockResponsesServer(): Promise<MockResponsesServer> {
     const server = http.createServer((req, res) => {
         let body = "";
         req.on("data", (chunk) => body += chunk);
-        req.on("end", () => {
+        req.on("end", async () => {
             requestCount++;
             const parsed = parseBody(body);
             requests.push(parsed);
             const isResponsesCall = req.method === "POST" && (req.url ?? "").split("?")[0]!.endsWith("/responses");
-            const next = isResponsesCall ? errorResponse ?? (responseHandler ? responseHandler(parsed) : queue.shift()) : undefined;
+            let next: string | MockErrorResponse | undefined;
+            try {
+                next = isResponsesCall ? errorResponse ?? (responseHandler ? await responseHandler(parsed) : queue.shift()) : undefined;
+            } catch (error) {
+                res.writeHead(500);
+                res.end(String(error));
+                return;
+            }
+            if (res.destroyed) return;
             if (next === undefined) {
                 unexpectedRequests++;
                 res.writeHead(isResponsesCall ? 400 : 404);

@@ -173,6 +173,7 @@ import {
 import {CodexSubagentEventRouter} from "./subagents/CodexSubagentEventRouter";
 import {StandardSubagentEventRouter} from "./subagents/StandardSubagentEventRouter";
 import {SubagentAssociations} from "./subagents/SubagentAssociations";
+import {SubagentInteractionHandlers} from "./subagents/SubagentInteractionHandlers";
 import type {SubagentEventRouter} from "./subagents/SubagentEventRouter";
 import {isRootAgentPath, nameFromAgentPath} from "./subagents/CodexAgentPath";
 import {listCodexHooks, trustCodexHooks, type CodexHookIdentity} from "./CodexHookTrust";
@@ -504,6 +505,7 @@ export class CodexAcpServer {
 
     private readonly sessions: Map<string, SessionState>;
     private readonly subagentAssociations = new SubagentAssociations();
+    private readonly subagentInteractionHandlers = new WeakMap<StandardSubagentEventRouter, SubagentInteractionHandlers>();
     private readonly mcpSessionStartup: McpSessionStartup;
     private readonly pendingTurnStarts: Map<string, PendingTurnStart>;
     private readonly activePrompts: Map<string, ActivePrompt>;
@@ -646,10 +648,47 @@ export class CodexAcpServer {
         }
         const session = new ACPSessionConnection(this.connection, sessionId);
         const release = (childId: string) => this.reportingConnection.reports.releaseOpen(childId);
-        return this.usesStandardSubagents()
+        const router = this.usesStandardSubagents()
             ? new StandardSubagentEventRouter(sessionId, session, this.subagentAssociations, release, this.capabilities, replay,
                 this.sessions.get(sessionId)?.subagentTransition)
             : new CodexSubagentEventRouter(sessionId, this.supportsNativeSubagents(), session, release);
+        if (router instanceof StandardSubagentEventRouter) this.getSubagentInteractionHandlers(router, sessionId);
+        return router;
+    }
+
+    private getSubagentInteractionHandlers(router: StandardSubagentEventRouter, rootSessionId: string): SubagentInteractionHandlers {
+        const existing = this.subagentInteractionHandlers.get(router);
+        if (existing) return existing;
+        const handlers = new SubagentInteractionHandlers(
+            this.connection, rootSessionId, this.clientCapabilities, new AcpToolCallRenderer(this.capabilities),
+        );
+        router.setInteractionObserver((event, sessionId) => handlers.observe(event, sessionId));
+        this.subagentInteractionHandlers.set(router, handlers);
+        return handlers;
+    }
+
+    private childInteractions(sessionId: string): {approvals: ApprovalHandler; elicitations: ElicitationHandler} | undefined {
+        const association = this.subagentAssociations.get(sessionId);
+        if (!association) return undefined;
+        const router = this.sessions.get(association.rootSessionId)?.subagents;
+        return router instanceof StandardSubagentEventRouter && !router.isRetired()
+            ? this.getSubagentInteractionHandlers(router, association.rootSessionId)
+            : {approvals: DENY_ALL_APPROVALS, elicitations: DENY_ALL_ELICITATIONS};
+    }
+
+    private routeChildApprovals(fallback: ApprovalHandler): ApprovalHandler {
+        return {
+            handleCommandExecution: params => (this.childInteractions(params.threadId)?.approvals ?? fallback).handleCommandExecution(params),
+            handleFileChange: params => (this.childInteractions(params.threadId)?.approvals ?? fallback).handleFileChange(params),
+            handlePermissionsRequest: params => (this.childInteractions(params.threadId)?.approvals ?? fallback).handlePermissionsRequest(params),
+        };
+    }
+
+    private routeChildElicitations(fallback: ElicitationHandler): ElicitationHandler {
+        return {
+            handleElicitation: params => (this.childInteractions(params.threadId)?.elicitations ?? fallback).handleElicitation(params),
+            handleUserInput: params => (this.childInteractions(params.threadId)?.elicitations ?? fallback).handleUserInput(params),
+        };
     }
 
     /** Called at the router boundary, never for the parent's internal runtime operations. */
@@ -672,18 +711,14 @@ export class CodexAcpServer {
     }
 
     afterSessionSetupResponse(sessionId: string): Promise<void> {
-        // Resolve the RPC first; release traffic on the next event-loop turn, then unblock the next setup.
-        return new Promise(resolve => setImmediate(() => {
-            const router = this.sessions.get(sessionId)?.subagents;
-            if (!(router instanceof StandardSubagentEventRouter) || this.sessionIsClosing(sessionId)) return resolve();
-            this.codexAcpClient.redispatchSessionNotifications(
-                sessionId, router.releaseReplay(), () => router.publishReplaySnapshots(),
-            );
-            void this.codexAcpClient.waitForSessionNotifications(sessionId).then(resolve, error => {
-                logger.error("Failed to release child traffic after session setup", error);
-                resolve();
-            });
-        }));
+        const router = this.sessions.get(sessionId)?.subagents;
+        if (!(router instanceof StandardSubagentEventRouter) || this.sessionIsClosing(sessionId)) return Promise.resolve();
+        this.codexAcpClient.redispatchSessionNotifications(
+            sessionId, router.releaseReplay(), () => router.publishReplaySnapshots(),
+        );
+        return this.codexAcpClient.waitForSessionNotifications(sessionId).catch(error => {
+            logger.error("Failed to release child traffic after session setup", error);
+        });
     }
 
     private async interruptStandardChildren(session: SessionState): Promise<void> {
@@ -1545,11 +1580,15 @@ export class CodexAcpServer {
                 await baselineEventHandler.handleSessionScopedNotification(event);
                 await this.trackCodexTurnCompletion(sessionState, event, baselineEventHandler);
             },
-            DENY_ALL_APPROVALS,
-            DENY_ALL_ELICITATIONS,
+            this.routeChildApprovals(DENY_ALL_APPROVALS),
+            this.routeChildElicitations(DENY_ALL_ELICITATIONS),
             this.supportsNativeSubagents(),
             () => {},
-            async () => null,
+            async childThreadId => {
+                const state = await ready;
+                return state?.subagents instanceof StandardSubagentEventRouter
+                    ? state.subagents.waitForMaterializedSession(childThreadId) : null;
+            },
             async (childId, itemId, request, turnId) => {
                 const state = await ready;
                 return state?.subagents.withUserAction?.(childId, itemId, request, turnId) ?? request();
@@ -4693,13 +4732,11 @@ export class CodexAcpServer {
             );
             promptElicitations = elicitationHandler;
             const observeInteraction = async (event: ServerNotification): Promise<void> => {
-                const scoped = sessionState.subagents instanceof StandardSubagentEventRouter
-                    && typeof (event.params as {threadId?: unknown}).threadId === "string"
-                    && sessionState.subagents.isNativeSubagentThread((event.params as {threadId: string}).threadId)
-                    ? {...event, params: {...event.params, threadId: sessionState.subagents.notificationSessionId(event)}} as ServerNotification
-                    : event;
-                permissionContext.handleNotification(scoped);
-                await elicitationHandler.handleNotification(scoped);
+                const threadId = (event.params as {threadId?: unknown}).threadId;
+                if (sessionState.subagents instanceof StandardSubagentEventRouter
+                    && typeof threadId === "string" && threadId !== sessionState.sessionId) return;
+                permissionContext.handleNotification(event);
+                await elicitationHandler.handleNotification(event);
             };
             const resolvePendingInsertion = async (): Promise<void> => {
                 if (pendingInsertion === undefined) {
@@ -4746,8 +4783,8 @@ export class CodexAcpServer {
                     }
                     await this.trackCodexTurnCompletion(sessionState, event, promptEventHandler);
                 },
-                approvalHandler,
-                elicitationHandler,
+                this.routeChildApprovals(approvalHandler),
+                this.routeChildElicitations(elicitationHandler),
                 this.supportsNativeSubagents(),
                 observeInteraction,
                 childThreadId => promptEventHandler.waitForNativeSubagentSession(childThreadId),

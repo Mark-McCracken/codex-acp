@@ -11,10 +11,22 @@ import {describeIntegration, INTEGRATION_MODEL_ID} from "./integration-fixture";
 import {functionCallResponse, startMockResponsesServer, textResponse} from "./mock-responses-server";
 
 describeIntegration("integration: standard subagent sessions", () => {
-    it.each([1, 2] as const)("announces and routes real Codex children through ACP v%s", async version => {
+    it.each(([1, 2] as const).flatMap(version =>
+        (["complete", "cancel", "close"] as const).map(ending => ({version, ending})),
+    ))("replays active Codex children through ACP v$version ($ending)", async ({version, ending}) => {
         const mock = await startMockResponsesServer();
         let delegated = false;
-        mock.setResponseHandler(request => {
+        let childRequested = false;
+        let releaseChild!: () => void;
+        const childResponse = new Promise<void>(resolve => { releaseChild = resolve; });
+        mock.setResponseHandler(async request => {
+            const metadata = (request as {client_metadata?: Record<string, string>}).client_metadata?.["x-codex-turn-metadata"];
+            const agentName = metadata ? (JSON.parse(metadata) as {agent_name?: string}).agent_name : undefined;
+            if (!childRequested && agentName === "/root/worker") {
+                childRequested = true;
+                await childResponse;
+                return textResponse("CHILD_RESULT");
+            }
             const model = (request as {model?: string}).model;
             if (model === INTEGRATION_MODEL_ID.model && !delegated) {
                 delegated = true;
@@ -53,6 +65,7 @@ describeIntegration("integration: standard subagent sessions", () => {
             : acpV2.client().onNotification(acpV2.methods.client.session.update, ctx => { updates.push(ctx.params); }).connect(stream);
         const context = connection.agent as {
             request(method: string, params: unknown, options: {cancellationSignal: AbortSignal}): Promise<any>;
+            notify(method: string, params: unknown): Promise<void>;
         };
         const request = async (method: string, params: unknown) => {
             try {
@@ -76,6 +89,44 @@ describeIntegration("integration: standard subagent sessions", () => {
             const prompt = request("session/prompt", {sessionId, prompt: [{type: "text", text: "Delegate once"}]});
             prompt.catch(() => {});
             await vi.waitFor(() => {
+                expect(childRequested, stderr).toBe(true);
+                expect(updates.some(entry => entry.sessionId === sessionId && entry.update.sessionUpdate === "subagent_update")).toBe(true);
+            }, {timeout: 15_000});
+            const childId = updates.find(entry => entry.sessionId === sessionId && entry.update.sessionUpdate === "subagent_update")!.update.sessionId;
+            const state = (entry: typeof updates[number]) => version === 1
+                ? entry.update.sessionUpdate === "subagent_update" && entry.update.sessionId === childId ? entry.update.state : undefined
+                : entry.sessionId === childId && entry.update.sessionUpdate === "state_update" ? entry.update : undefined;
+            await vi.waitFor(() => expect(updates.some(entry => state(entry)?.state === "running")).toBe(true));
+            await prompt;
+            if (version === 2) {
+                await vi.waitFor(() => expect(updates.filter(entry => entry.sessionId === sessionId
+                    && entry.update.sessionUpdate === "state_update").at(-1)?.update.state).toBe("idle"));
+            }
+            const load = (id: string) => request(version === 1 ? "session/load" : "session/resume", {
+                sessionId: id, cwd, mcpServers: [], ...(version === 2 ? {replayFrom: {type: "start"}} : {}),
+            });
+            const replayStart = updates.length;
+            await load(sessionId);
+            await vi.waitFor(() => expect(updates.slice(replayStart).some(entry => state(entry)?.state === "running")).toBe(true));
+            const boundary = updates.length;
+            if (ending === "complete") {
+                const fork = await request("session/fork", {sessionId, cwd, mcpServers: []});
+                await load(fork.sessionId);
+                const forkChildren = updates.filter(entry => entry.sessionId === fork.sessionId && entry.update.sessionUpdate === "subagent_update");
+                expect(forkChildren.length, JSON.stringify(updates)).toBeGreaterThan(0);
+                expect(forkChildren.every(entry => entry.update.sessionId !== childId)).toBe(true);
+                await request("session/close", {sessionId: fork.sessionId});
+            } else {
+                if (ending === "cancel") await context.notify("session/cancel", {sessionId});
+                else await request("session/close", {sessionId});
+                await vi.waitFor(() => expect(updates.slice(boundary).some(entry => {
+                    const current = state(entry);
+                    return ending === "close" ? current?.state === "unknown"
+                        : current?.state === "idle" && current.stopReason === "cancelled";
+                }), `${stderr}\n${JSON.stringify(updates)}`).toBe(true), {timeout: 15_000});
+            }
+            releaseChild();
+            if (ending === "complete") await vi.waitFor(() => {
                 const child = updates.find(entry => entry.sessionId === sessionId && entry.update.sessionUpdate === "subagent_update");
                 const requests = mock.requests.map(request => {
                     const body = request as {model?: string; tools?: Array<{name?: string; type?: string}>; input?: Array<{type?: string}>};
@@ -95,6 +146,7 @@ describeIntegration("integration: standard subagent sessions", () => {
             expect(updates.some(entry => ["subagent_spawned", "subagent_state_update", "_subagent_update"].includes(entry.update.sessionUpdate))).toBe(false);
             expect(mock.unexpectedRequests).toBe(0);
         } finally {
+            releaseChild();
             connection.close();
             child.kill("SIGTERM");
             if (child.exitCode === null) await once(child, "exit");
