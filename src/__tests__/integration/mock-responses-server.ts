@@ -53,8 +53,9 @@ export async function startMockResponsesServer(): Promise<MockResponsesServer> {
             try {
                 next = isResponsesCall ? errorResponse ?? (responseHandler ? await responseHandler(parsed) : queue.shift()) : undefined;
             } catch (error) {
+                console.error("Mock Responses API handler failed", error);
                 res.writeHead(500);
-                res.end(String(error));
+                res.end("mock: response handler failed");
                 return;
             }
             if (res.destroyed) return;
