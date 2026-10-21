@@ -6,6 +6,7 @@ import {appendFileSync, mkdirSync, mkdtempSync, writeFileSync} from "node:fs";
 import {join} from "node:path";
 import {Readable, Writable} from "node:stream";
 import {expect, it, vi} from "vitest";
+import {AgentMode} from "../../AgentMode";
 import {removeDirectoryWithRetry, writeCodexHomeConfig} from "../acp-test-utils";
 import {describeIntegration, INTEGRATION_MODEL_ID} from "./integration-fixture";
 import {functionCallResponse, startMockResponsesServer, textResponse} from "./mock-responses-server";
@@ -61,7 +62,8 @@ describeIntegration("integration: standard subagent sessions", () => {
         appendFileSync(join(codexHome, "config.toml"), "\nfeatures.multi_agent = true\nfeatures.multi_agent_v2 = true\n");
         const child = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
             cwd: process.cwd(), env: {...process.env, CODEX_HOME: codexHome,
-                ...(ending === "terminal" ? {INITIAL_AGENT_MODE: "workspace-write"} : {})}, stdio: ["pipe", "pipe", "pipe"],
+                // The scripted local command tests terminal routing, not host sandbox support.
+                ...(ending === "terminal" ? {INITIAL_AGENT_MODE: AgentMode.AgentFullAccess.id} : {})}, stdio: ["pipe", "pipe", "pipe"],
         });
         let stderr = "";
         child.stderr.on("data", chunk => { stderr += chunk.toString(); });
