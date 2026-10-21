@@ -1,10 +1,11 @@
 import type {ServerNotification} from "../app-server";
 import type {StateUpdate} from "@agentclientprotocol/sdk/experimental/v2/unstable";
-import type {ThreadItem} from "../app-server/v2";
+import type {Thread, ThreadItem} from "../app-server/v2";
 import {ACPSessionConnection} from "../ACPSessionConnection";
 import {AcpV2ForegroundState} from "../AcpV2ForegroundState";
 import {CodexPlanStream} from "../CodexPlanStream";
 import {CodexSessionToolCalls} from "../CodexSessionToolCalls";
+import {CodexItemStreamState} from "../CodexItemStreamState";
 import {ClientCapabilities} from "../tool-calls/ClientCapabilities";
 import {readableServiceErrorMessage} from "../ServiceErrorMessage";
 import {toV2IdleState} from "../AcpV2Prompt";
@@ -24,9 +25,12 @@ type Child = SubagentAssociation & {
     path?: string;
     title?: string | null;
     description?: string;
+    /** Last turn admitted for presentation; native requests can advance before buffered events. */
     turnId: string | null;
+    foregroundTurnId: string | null;
     foreground: AcpV2ForegroundState;
     toolCalls: CodexSessionToolCalls;
+    streams: CodexItemStreamState;
     requests: AbortController;
     workRequests: Map<string, {controller: AbortController; count: number}>;
     closedRequestTurns: Set<string>;
@@ -62,8 +66,35 @@ export class StandardSubagentEventRouter implements SubagentEventRouter {
         private readonly capabilities = ClientCapabilities.DEFAULT,
         private deferLive = false,
         private readonly ready: Promise<void> = Promise.resolve(),
+        private readonly runningTurnId: (threadId: string) => string | undefined = () => undefined,
     ) {
         this.deferredLive = new PendingNotificationBuffer(rootSessionId);
+    }
+
+    /** Admit child events before any renderer, cleanup, or other presentation side effect. */
+    async prepareNotification(notification: ServerNotification): Promise<boolean> {
+        const threadId = (notification.params as {threadId?: unknown}).threadId;
+        if (typeof threadId !== "string" || threadId === this.rootSessionId) return true;
+        if (this.retired) return false;
+        const params = notification.params as {itemId?: string; item?: {id: string}};
+        const itemId = params.itemId ?? params.item?.id;
+        if (itemId !== undefined && this.replayedItems.get(threadId)?.has(itemId)) return false;
+        if (this.deferLive) {
+            this.deferredLive.push(notification);
+            return false;
+        }
+        const child = this.children.get(threadId);
+        if (!child) {
+            const pending = this.pendingFor(threadId);
+            pending.notifications.push(notification);
+            if (await this.restoreKnown(threadId)) {
+                this.pending.delete(threadId);
+                for (const event of pending.notifications.take()) this.replayQueue.push(event);
+            }
+            return false;
+        }
+        await this.ensureAnnounced(child);
+        return !this.retired;
     }
 
     async handle(notification: ServerNotification): Promise<boolean> {
@@ -74,22 +105,6 @@ export class StandardSubagentEventRouter implements SubagentEventRouter {
                 || ((notification.method === "item/started" || notification.method === "item/completed")
                     && (notification.params.item.type === "subAgentActivity"
                         || notification.params.item.type === "collabAgentToolCall"));
-        }
-        const params = notification.params as {itemId?: string; item?: {id: string}};
-        const itemId = params.itemId ?? params.item?.id;
-        if (itemId !== undefined && this.replayedItems.get(threadId)?.has(itemId)) return true;
-        if (threadId !== this.rootSessionId && this.deferLive) {
-            this.deferredLive.push(notification);
-            return true;
-        }
-        if (threadId !== this.rootSessionId && !this.children.has(threadId)) {
-            const pending = this.pendingFor(threadId);
-            pending.notifications.push(notification);
-            if (await this.restoreKnown(threadId)) {
-                this.pending.delete(threadId);
-                for (const event of pending.notifications.take()) this.replayQueue.push(event);
-            }
-            return true;
         }
         if (notification.method === "item/started" || notification.method === "item/completed") {
             const item = notification.params.item;
@@ -139,19 +154,23 @@ export class StandardSubagentEventRouter implements SubagentEventRouter {
             && (child.turnId === null || child.turnId === progressTurnId)) {
             if (child.turnId === null) {
                 child.turnId = progressTurnId;
-                child.foreground.invalidate();
             }
-            await child.foreground.update({state: "running"});
+            if (this.isCurrentForeground(child, progressTurnId)) {
+                this.beginForegroundTurn(child, progressTurnId);
+                await child.foreground.update({state: "running"});
+            }
         }
         switch (notification.method) {
             case "turn/started":
                 if (child.endedTurns.has(notification.params.turn.id)) return true;
                 if (child.turnId !== notification.params.turn.id) {
                     if (child.turnId !== null) this.endWorkRequests(child, child.turnId);
-                    child.foreground.invalidate();
                 }
                 child.turnId = notification.params.turn.id;
-                await child.foreground.start();
+                if (this.isCurrentForeground(child, child.turnId)) {
+                    this.beginForegroundTurn(child, child.turnId);
+                    await child.foreground.start();
+                }
                 return true;
             case "thread/name/updated": {
                 const title = normalizeSessionTitle(notification.params.threadName);
@@ -177,6 +196,8 @@ export class StandardSubagentEventRouter implements SubagentEventRouter {
                 this.endWorkRequests(child, turn.id);
                 child.endedTurns.add(turn.id);
                 if (child.turnId !== null && child.turnId !== turn.id) return true;
+                child.turnId = null;
+                if (child.foregroundTurnId !== null && child.foregroundTurnId !== turn.id) return true;
                 await child.foreground.update(toV2IdleState(
                     {stopReason: turn.status === "interrupted" ? "cancelled" : "end_turn"},
                     turn.status === "failed" ? {
@@ -184,7 +205,7 @@ export class StandardSubagentEventRouter implements SubagentEventRouter {
                         message: turn.error ? readableServiceErrorMessage(turn.error.message) : "Subagent work failed",
                     } : undefined,
                 ));
-                child.turnId = null;
+                child.foregroundTurnId = null;
                 this.onChildWorkEnded(child.sessionId);
                 return true;
             }
@@ -197,13 +218,14 @@ export class StandardSubagentEventRouter implements SubagentEventRouter {
                 }
                 return true;
             case "item/started":
-                if (child.turnId !== null && notification.params.item.type !== "userMessage") {
+                if (child.turnId !== null && child.foregroundTurnId === notification.params.turnId
+                    && notification.params.item.type !== "userMessage") {
                     await child.foreground.startItem(notification.params.item.id);
                 }
                 if (notification.params.item.type === "plan") return true;
                 break;
             case "item/completed": {
-                await child.foreground.completeItem(notification.params.item.id);
+                if (child.foregroundTurnId === notification.params.turnId) await child.foreground.completeItem(notification.params.item.id);
                 const item = notification.params.item;
                 if (item.type === "plan") {
                     // Completed snapshots avoid replaying a partial draft over newer history.
@@ -293,12 +315,17 @@ export class StandardSubagentEventRouter implements SubagentEventRouter {
         const association = this.associations.register(this.rootSessionId, parentSessionId, threadId);
         const title = path === undefined ? undefined : nameFromAgentPath(path, "Agent");
         const child: Child = {
-            ...association, turnId: null,
+            ...association, turnId: null, foregroundTurnId: null,
             ...(path !== undefined ? {path: normalizeAgentPath(path)} : {}),
             ...(title !== undefined ? {title} : {}),
             ...(description !== undefined ? {description} : {}),
             foreground: new AcpV2ForegroundState(async state => {
-                if (this.retired && state.state !== "unknown") return;
+                if (this.retired) {
+                    if (state.state === "unknown" && this.announced.has(threadId)) {
+                        await this.session.updateSubagentState(association.sessionId, parentSessionId, state);
+                    }
+                    return;
+                }
                 if (this.deferLive || this.snapshotting) {
                     this.snapshots.set(threadId, {child, state});
                     return;
@@ -306,6 +333,7 @@ export class StandardSubagentEventRouter implements SubagentEventRouter {
                 await this.session.updateSubagentState(association.sessionId, parentSessionId, state);
             }, "unknown"),
             toolCalls: new CodexSessionToolCalls(),
+            streams: new CodexItemStreamState(),
             requests: new AbortController(),
             workRequests: new Map(),
             closedRequestTurns: new Set(),
@@ -343,13 +371,20 @@ export class StandardSubagentEventRouter implements SubagentEventRouter {
     }
 
     async publishReplaySnapshots(): Promise<void> {
-        this.snapshotting = false;
-        const snapshots = [...this.snapshots.values()];
-        this.snapshots.clear();
-        if (this.retired) return;
-        for (const {child, state} of snapshots) {
-            await this.ensureAnnounced(child);
-            await this.session.updateSubagentState(child.sessionId, child.parentSessionId, state);
+        try {
+            while (this.snapshots.size > 0) {
+                for (const {child} of [...this.snapshots.values()]) {
+                    await child.foreground.serializePublication(async () => {
+                        const snapshot = this.snapshots.get(child.threadId);
+                        this.snapshots.delete(child.threadId);
+                        if (!snapshot || this.retired) return;
+                        await this.ensureAnnounced(child);
+                        await this.session.updateSubagentState(child.sessionId, child.parentSessionId, snapshot.state);
+                    });
+                }
+            }
+        } finally {
+            this.snapshotting = false;
         }
     }
 
@@ -376,7 +411,9 @@ export class StandardSubagentEventRouter implements SubagentEventRouter {
         const obsolete = typeof turnId === "string" && (child.closedRequestTurns.has(turnId) || child.endedTurns.has(turnId));
         const signal = this.retired || obsolete ? AbortSignal.abort() : work
             ? AbortSignal.any([child.requests.signal, work.controller.signal]) : child.requests.signal;
-        const foreground = !this.deferLive && !this.retired && child.turnId !== null && child.turnId === turnId;
+        const foreground = !this.retired && !obsolete && typeof turnId === "string"
+            && (this.runningTurnId(child.threadId) ?? child.turnId) === turnId;
+        if (foreground) this.beginForegroundTurn(child, turnId);
         try {
             return await runSubagentInteraction({
                 sessionId, signal,
@@ -395,6 +432,17 @@ export class StandardSubagentEventRouter implements SubagentEventRouter {
     private endWorkRequests(child: Child, turnId: string): void {
         child.workRequests.get(turnId)?.controller.abort();
         child.workRequests.delete(turnId);
+    }
+
+    private beginForegroundTurn(child: Child, turnId: string): void {
+        if (child.foregroundTurnId === turnId) return;
+        child.foregroundTurnId = turnId;
+        child.foreground.invalidate();
+    }
+
+    private isCurrentForeground(child: Child, turnId: string): boolean {
+        const current = this.runningTurnId(child.threadId);
+        return current === undefined || current === turnId;
     }
 
     /** Withdraw requests at receipt time, before output backpressure can delay terminal rendering. */
@@ -430,6 +478,7 @@ export class StandardSubagentEventRouter implements SubagentEventRouter {
         child.workRequests.clear();
         await child.foreground.update({state: "unknown"});
         child.turnId = null;
+        child.foregroundTurnId = null;
     }
 
     async finishOutstanding(state: SubagentState): Promise<void> {
@@ -461,9 +510,41 @@ export class StandardSubagentEventRouter implements SubagentEventRouter {
         return this.children.get(threadId)?.toolCalls;
     }
 
-    rememberReplayedItem(threadId: string, itemId: string): void {
+    itemStreams(threadId: string): CodexItemStreamState | undefined {
+        return this.children.get(threadId)?.streams;
+    }
+
+    parentThreadId(threadId: string): string | undefined {
+        const parentId = this.children.get(threadId)?.parentSessionId;
+        return parentId === this.rootSessionId ? this.rootSessionId
+            : parentId === undefined ? undefined : this.associations.get(parentId)?.threadId;
+    }
+
+    async restoreRuntime(thread: Thread, turnId: string | undefined): Promise<void> {
+        const child = this.children.get(thread.id);
+        if (!child || this.retired) return;
+        child.live = true;
+        if (thread.status.type === "idle") {
+            child.turnId = null;
+            child.foregroundTurnId = null;
+            await child.foreground.update({state: "idle"});
+        } else if (thread.status.type === "active" && thread.status.activeFlags.length === 0) {
+            child.turnId ??= turnId ?? null;
+            if (child.turnId !== null) this.beginForegroundTurn(child, child.turnId);
+            await child.foreground.start();
+        }
+    }
+
+    reconcileHistoryItem(threadId: string, item: ThreadItem, completed: boolean, turnId?: string): void {
+        const child = this.children.get(threadId);
+        if (!child) return;
+        child.toolCalls.restore(item, completed, turnId);
+        if (item.type === "commandExecution") child.streams.commands.restore(item);
+        if (item.type === "agentMessage") child.streams.agentMessagePhases.set(item.id, item.phase);
+        if (item.type === "imageView" && !completed) child.streams.emittedImageViewItems.add(item.id);
+        if (!completed) return;
         const items = this.replayedItems.get(threadId) ?? new Set<string>();
-        items.add(itemId);
+        items.add(item.id);
         this.replayedItems.set(threadId, items);
     }
 

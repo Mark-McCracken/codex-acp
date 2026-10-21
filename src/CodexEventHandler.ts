@@ -36,12 +36,12 @@ import type {
 import {toTokenCount} from "./TokenCount";
 import { stripShellPrefix } from "./CommandUtils";
 import {AcpToolCallRenderer} from "./tool-calls/AcpToolCallRenderer";
-import {CommandReporter, commandUsesTerminal} from "./tool-calls/reporters/CommandReporter";
+import {commandUsesTerminal} from "./tool-calls/reporters/CommandReporter";
 import {CompactionReporter} from "./tool-calls/reporters/CompactionReporter";
 import {DynamicToolReporter} from "./tool-calls/reporters/DynamicToolReporter";
 import {FileChangeReporter} from "./tool-calls/reporters/FileChangeReporter";
-import {FuzzySearchReporter} from "./tool-calls/reporters/FuzzySearchReporter";
-import {GuardianReporter} from "./tool-calls/reporters/GuardianReporter";
+import {CodexItemStreamState} from "./CodexItemStreamState";
+import {PLAIN_TOOL_CALL_ITEM_TYPES} from "./CodexSessionToolCalls";
 import {ImageGenerationReporter} from "./tool-calls/reporters/ImageGenerationReporter";
 import {ImageViewReporter} from "./tool-calls/reporters/ImageViewReporter";
 import {McpToolReporter} from "./tool-calls/reporters/McpToolReporter";
@@ -183,22 +183,6 @@ const STRUCTURED_CODEX_ERROR_CATEGORIES = {
     activeTurnNotSteerable: "provider_error",
 } satisfies Record<StructuredCodexErrorKind, CodexFailureKind>;
 
-/**
- * Item types that render as a plain `tool_call`/`tool_call_update` and have no outstanding-item
- * tracker of their own (`contextCompaction` has `CodexSessionCompactions`; `collabAgentToolCall`/
- * `subAgentActivity` have `CodexSubagentEventRouter`). Used to track which open items a provider
- * restart's close-out needs to fail.
- */
-const PLAIN_TOOL_CALL_ITEM_TYPES = new Set<ThreadItem["type"]>([
-    "fileChange",
-    "commandExecution",
-    "mcpToolCall",
-    "dynamicToolCall",
-    "webSearch",
-    "imageView",
-    "imageGeneration",
-]);
-
 /** Prompt failures whose text the client has already received as an agent message. */
 const failuresShownAsMessages = new WeakSet<RequestError>();
 
@@ -222,17 +206,11 @@ export class CodexEventHandler {
     private failure: RequestError | null = null;
     private terminalTurnError: {turnId: string; error: ErrorNotification["error"]} | null = null;
     private completedPlan: CompletedPlan | null = null;
-    private readonly activeImageGenerationItems = new Set<string>();
-    private readonly emittedImageViewItems = new Set<string>();
     private readonly session: ACPSessionConnection;
     private readonly renderer: AcpToolCallRenderer;
-    private readonly commands = new CommandReporter();
-    private readonly fuzzySearches = new FuzzySearchReporter();
-    private readonly guardianReviews = new GuardianReporter();
+    private readonly rootStreams = new CodexItemStreamState();
     private readonly plans: CodexPlanStream;
     private disposed = false;
-    private readonly seenReasoningDeltaItemIds = new Set<string>();
-    private readonly agentMessagePhases = new Map<string, string | null>();
     private readonly turnDiffs = new Map<string, string>();
     private readonly oversizedTurnDiffs = new Set<string>();
     /** Latest diff of each subagent turn, keyed by child thread and turn; `null` marks an oversized diff. */
@@ -440,19 +418,18 @@ export class CodexEventHandler {
         if (notification.method === "turn/diff/updated" && notification.params.threadId !== this.sessionState.sessionId) {
             this.recordChildTurnDiff(notification.params);
         }
-        await this.flushPendingErrors();
         if (this.subagents instanceof StandardSubagentEventRouter
-            && typeof threadId === "string" && threadId !== this.sessionState.sessionId
-            && !this.subagents.isNativeSubagentThread(threadId)) {
-            await this.subagents.handle(notification);
+            && !await this.subagents.prepareNotification(notification)) {
             for (const event of this.subagents.takeBufferedNotifications()) await this.handleNotification(event);
             return;
         }
+        await this.flushPendingErrors();
         await this.finishCompactionsForNotification(notification);
         const closingChildren = this.subagents.closingChildSessions(notification);
         for (const child of closingChildren) {
             if (this.subagents instanceof StandardSubagentEventRouter) {
-                for (const update of this.subagents.openToolCalls(child.threadId)?.finishOutstanding() ?? []) {
+                const turnId = notification.method === "turn/completed" ? notification.params.turn.id : undefined;
+                for (const update of this.subagents.openToolCalls(child.threadId)?.finishOutstanding(turnId) ?? []) {
                     await this.session.update(update, child.sessionId);
                 }
             }
@@ -589,7 +566,7 @@ export class CodexEventHandler {
             case "item/started": {
                 this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
                 const update = await this.createItemEvent(notification.params);
-                this.trackOpenToolCall(notification.params.item, notification.params.threadId);
+                this.trackOpenToolCall(notification.params.item, notification.params.threadId, notification.params.turnId);
                 return update;
             }
             case "item/completed":
@@ -675,7 +652,7 @@ export class CodexEventHandler {
                 });
             case "item/commandExecution/outputDelta":
                 this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
-                return this.renderer.render(this.commands.outputDelta(notification.params.itemId, notification.params.delta));
+                return this.renderer.render(this.streamsFor(notification.params.threadId).commands.outputDelta(notification.params.itemId, notification.params.delta));
             case "item/mcpToolCall/progress":
                 this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
                 // AIR does not show MCP progress.
@@ -699,9 +676,9 @@ export class CodexEventHandler {
             case "deprecationNotice":
                 return this.createDeprecationNoticeEvent(notification.params);
             case "item/autoApprovalReview/started":
-                return this.renderer.render(this.guardianReviews.started(notification.params));
+                return this.renderer.render(this.streamsFor(notification.params.threadId).guardianReviews.started(notification.params));
             case "item/autoApprovalReview/completed":
-                return this.renderer.render(this.guardianReviews.completed(notification.params));
+                return this.renderer.render(this.streamsFor(notification.params.threadId).guardianReviews.completed(notification.params));
             case "thread/compacted":
                 return this.supportsCompaction
                     ? this.sessionState.compactions.completeLegacy(
@@ -720,15 +697,15 @@ export class CodexEventHandler {
             case "model/rerouted":
                 return this.createModelReroutedEvent(notification.params);
             case "fuzzyFileSearch/sessionUpdated":
-                return this.renderer.render(this.fuzzySearches.updated(notification.params));
+                return this.renderer.render(this.rootStreams.fuzzySearches.updated(notification.params));
             case "fuzzyFileSearch/sessionCompleted":
-                return this.renderer.render(this.fuzzySearches.completed(notification.params));
+                return this.renderer.render(this.rootStreams.fuzzySearches.completed(notification.params));
             case "thread/goal/updated":
                 return this.createThreadGoalUpdatedEvent(notification.params);
             case "thread/goal/cleared":
                 return this.createThreadGoalClearedEvent(notification.params);
             case "item/commandExecution/terminalInteraction":
-                return this.renderer.render(this.commands.terminalInput(
+                return this.renderer.render(this.streamsFor(notification.params.threadId).commands.terminalInput(
                     notification.params.itemId,
                     notification.params.stdin,
                 ));
@@ -803,7 +780,7 @@ export class CodexEventHandler {
     }
 
     private async createTextEvent(event: AgentMessageDeltaNotification): Promise<UpdateSessionEvent> {
-        const phase = this.agentMessagePhases.get(event.itemId) ?? null;
+        const phase = this.streamsFor(event.threadId).agentMessagePhases.get(event.itemId) ?? null;
         const meta = createMessagePhaseMeta(phase, this.sessionState.clientCapabilities.airClient);
         return createAgentTextMessageChunk(event.delta, event.itemId, meta);
     }
@@ -875,12 +852,12 @@ export class CodexEventHandler {
     private createReasoningDeltaEvent(
         event: ReasoningSummaryTextDeltaNotification | ReasoningTextDeltaNotification
     ): UpdateSessionEvent {
-        this.seenReasoningDeltaItemIds.add(event.itemId);
+        this.streamsFor(event.threadId).seenReasoningDeltaItemIds.add(event.itemId);
         return this.createAgentThoughtEvent(event.delta, event.itemId);
     }
 
     private createReasoningSectionBreakEvent(event: ReasoningSummaryPartAddedNotification): UpdateSessionEvent {
-        this.seenReasoningDeltaItemIds.add(event.itemId);
+        this.streamsFor(event.threadId).seenReasoningDeltaItemIds.add(event.itemId);
         return this.createAgentThoughtEvent("\n\n", event.itemId);
     }
 
@@ -896,7 +873,7 @@ export class CodexEventHandler {
                     this.sessionState.clientCapabilities.diffPatchFormat,
                 ));
             case "commandExecution":
-                return this.renderer.render(this.commands.started(event.item));
+                return this.renderer.render(this.streamsFor(event.threadId).commands.started(event.item));
             case "mcpToolCall":
                 return this.renderer.render(McpToolReporter.started(event.item));
             case "dynamicToolCall":
@@ -904,15 +881,15 @@ export class CodexEventHandler {
             case "webSearch":
                 return this.renderer.render(WebSearchReporter.started(event.item));
             case "imageView":
-                this.emittedImageViewItems.add(event.item.id);
+                this.streamsFor(event.threadId).emittedImageViewItems.add(event.item.id);
                 return this.renderer.render(ImageViewReporter.viewed(event.item));
             case "imageGeneration":
-                this.activeImageGenerationItems.add(event.item.id);
+                this.streamsFor(event.threadId).activeImageGenerationItems.add(event.item.id);
                 return this.renderer.render(ImageGenerationReporter.started(event.item));
             case "collabAgentToolCall":
                 return this.renderer.render(this.subagents.legacyCollaborationStarted(event.item));
             case "agentMessage":
-                this.rememberAgentMessagePhase(event.item);
+                this.rememberAgentMessagePhase(event.item, event.threadId);
                 return null;
             case "contextCompaction":
                 return this.supportsCompaction
@@ -944,18 +921,18 @@ export class CodexEventHandler {
             case "mcpToolCall":
                 return this.renderer.render(McpToolReporter.completed(event.item));
             case "commandExecution":
-                return this.renderer.render(this.commands.completed(event.item, true));
+                return this.renderer.render(this.streamsFor(event.threadId).commands.completed(event.item, true));
             case "imageView":
-                if (this.emittedImageViewItems.delete(event.item.id)) {
+                if (this.streamsFor(event.threadId).emittedImageViewItems.delete(event.item.id)) {
                     return null;
                 }
                 return this.renderer.render(ImageViewReporter.viewed(event.item));
             case "imageGeneration":
-                return this.renderer.render(this.activeImageGenerationItems.delete(event.item.id)
+                return this.renderer.render(this.streamsFor(event.threadId).activeImageGenerationItems.delete(event.item.id)
                     ? ImageGenerationReporter.completed(event.item)
                     : ImageGenerationReporter.whole(event.item));
             case "reasoning":
-                if (this.seenReasoningDeltaItemIds.delete(event.item.id)) {
+                if (this.streamsFor(event.threadId).seenReasoningDeltaItemIds.delete(event.item.id)) {
                     return null;
                 }
                 return this.createCompletedReasoningEvent(event.item);
@@ -964,7 +941,7 @@ export class CodexEventHandler {
             case "collabAgentToolCall":
                 return this.renderer.render(this.subagents.legacyCollaborationCompleted(event.item));
             case "agentMessage":
-                this.rememberAgentMessagePhase(event.item);
+                this.rememberAgentMessagePhase(event.item, event.threadId);
                 return null;
             case "plan":
                 return await this.createCompletedPlanEvent(event.item);
@@ -989,8 +966,13 @@ export class CodexEventHandler {
         }
     }
 
-    private rememberAgentMessagePhase(item: ThreadItem & { type: "agentMessage" }): void {
-        this.agentMessagePhases.set(item.id, item.phase);
+    private streamsFor(threadId: string): CodexItemStreamState {
+        return this.subagents instanceof StandardSubagentEventRouter
+            ? this.subagents.itemStreams(threadId) ?? this.rootStreams : this.rootStreams;
+    }
+
+    private rememberAgentMessagePhase(item: ThreadItem & { type: "agentMessage" }, threadId: string): void {
+        this.streamsFor(threadId).agentMessagePhases.set(item.id, item.phase);
     }
 
     private createCompletedReasoningEvent(item: ThreadItem & { type: "reasoning" }): UpdateSessionEvent | null {
@@ -1034,10 +1016,10 @@ export class CodexEventHandler {
             : this.sessionState.openToolCalls;
     }
 
-    private trackOpenToolCall(item: ThreadItem, threadId: string): void {
+    private trackOpenToolCall(item: ThreadItem, threadId: string, turnId: string): void {
         if (!PLAIN_TOOL_CALL_ITEM_TYPES.has(item.type)) return;
         const hasTerminal = item.type === "commandExecution" && commandUsesTerminal(item);
-        this.openToolCalls(threadId).start(item.id, hasTerminal);
+        this.openToolCalls(threadId).start(item.id, hasTerminal, turnId);
     }
 
     private async updatePlan(event: TurnPlanUpdatedNotification): Promise<UpdateSessionEvent> {

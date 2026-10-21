@@ -414,7 +414,7 @@ export function userMessageItem(clientId: string | null, text = "Hello"): Thread
 }
 
 /** A long-running command (no single known action, so it uses a terminal) */
-export function commandExecutionItem(id: string, status: "inProgress" | "completed" | "failed" = "inProgress"): ThreadItem {
+export function commandExecutionItem(id: string, status: "inProgress" | "completed" | "failed" = "inProgress"): Extract<ThreadItem, {type: "commandExecution"}> {
     return {
         type: "commandExecution",
         id,

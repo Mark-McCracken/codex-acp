@@ -4,6 +4,7 @@ import type {
     ElicitationHandler,
 } from "../CodexAppServerClient";
 import type {ServerNotification} from "../app-server";
+import type {Thread} from "../app-server/v2";
 import {isRootAgentPath} from "./CodexAgentPath";
 
 export type SubagentInteraction = <T>(
@@ -66,6 +67,29 @@ export class CodexSubagentSubscriptions {
         for (const notification of notifications) session.current.dispatch(notification);
     }
 
+    /** History identifies a conversation; current provider parentage establishes runtime ownership. */
+    async restoreChild(rootSessionId: string, parentThreadId: string, thread: Thread): Promise<Thread | null> {
+        const session = this.sessions.get(rootSessionId);
+        if (!session || session.children.has(thread.id) || thread.parentThreadId !== parentThreadId
+            || (parentThreadId !== rootSessionId && !session.children.has(parentThreadId))) return null;
+        if (!this.attachChild(session, thread.id)) return null;
+        // An owned but inactive child can wake later without another spawn announcement.
+        if (thread.status.type === "notLoaded") return null;
+        try {
+            // Rejoin an existing runtime without changing its execution context or instructions.
+            const response = await this.client.threadResume({threadId: thread.id, excludeTurns: true});
+            if (this.sessions.get(rootSessionId) === session && response.thread.id === thread.id
+                && response.thread.parentThreadId === parentThreadId && response.thread.status.type !== "notLoaded") {
+                return response.thread;
+            }
+        } catch (error) {
+            this.detachChild(session, thread.id);
+            throw error;
+        }
+        this.detachChild(session, thread.id);
+        return null;
+    }
+
     private discover(session: SessionSubscription, event: ServerNotification): void {
         if (event.method !== "item/started" && event.method !== "item/completed") {
             return;
@@ -83,18 +107,28 @@ export class CodexSubagentSubscriptions {
                 || session.children.has(childSessionId)) {
                 continue;
             }
-            session.children.add(childSessionId);
-            this.client.onServerNotification(childSessionId, (childEvent) => {
-                const eventThreadId = (childEvent.params as {threadId?: unknown}).threadId;
-                if (eventThreadId !== childSessionId) return;
-                this.discover(session, childEvent);
-                session.current.observeWorkEnd?.(childEvent);
-                if (session.current.supportsSubagents) session.current.dispatch(childEvent);
-                else session.current.enqueueInteraction(this.rootAttributed(childEvent, session.current.rootSessionId));
-            });
-            // Hidden children keep only root-attributed permission requests.
-            this.registerInteractiveHandlers(session, childSessionId);
+            this.attachChild(session, childSessionId);
         }
+    }
+
+    private attachChild(session: SessionSubscription, childSessionId: string): boolean {
+        if ([...this.sessions.values()].some(other => other !== session
+            && (other.current.rootSessionId === childSessionId || other.children.has(childSessionId)))) return false;
+        session.children.add(childSessionId);
+        this.client.onServerNotification(childSessionId, (event) => {
+            if ((event.params as {threadId?: unknown}).threadId !== childSessionId) return;
+            this.discover(session, event);
+            session.current.observeWorkEnd?.(event);
+            if (session.current.supportsSubagents) session.current.dispatch(event);
+            else session.current.enqueueInteraction(this.rootAttributed(event, session.current.rootSessionId));
+        });
+        this.registerInteractiveHandlers(session, childSessionId);
+        return true;
+    }
+
+    private detachChild(session: SessionSubscription, childSessionId: string): void {
+        if (this.sessions.get(session.current.rootSessionId) !== session || !session.children.delete(childSessionId)) return;
+        if (!this.sessions.has(childSessionId)) this.client.clearThreadHandlers(childSessionId);
     }
 
     private registerInteractiveHandlers(session: SessionSubscription, targetSessionId: string): void {

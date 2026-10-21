@@ -105,7 +105,12 @@ export class AcpV2ForegroundState {
     }
 
     private publish(state: acpV2.StateUpdate): Promise<void> {
-        const sent = this.sending.then(() => this.notify(state));
+        return this.serializePublication(() => this.notify(state));
+    }
+
+    /** Replay flushes share the same ordering as live state publication. */
+    serializePublication(publish: () => Promise<void>): Promise<void> {
+        const sent = this.sending.then(publish);
         this.sending = sent.catch(() => {});
         return sent;
     }

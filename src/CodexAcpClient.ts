@@ -84,6 +84,7 @@ import {
 } from "./GatewayModelDiscovery";
 import {findSupportedEffort} from "./ModelConfigOption";
 export type {SessionMetadata, SessionMetadataWithThread} from "./SessionMetadata";
+export type SubagentHistoryItem = {item: ThreadItem; completed: boolean; turnId?: string};
 
 /**
  * The slice of `thread/resume` the session layer consumes, plus whether Codex
@@ -827,13 +828,20 @@ export class CodexAcpClient {
     }
 
     /** A standard child is one conversation, not one synthetic session per delegation. */
-    async readSessionItems(sessionId: string): Promise<AsyncIterable<ThreadItem[]>> {
+    async readSessionItems(sessionId: string): Promise<{
+        thread: Thread;
+        items: AsyncIterable<SubagentHistoryItem[]>;
+    }> {
         const metadata = await this.codexClient.threadRead({threadId: sessionId});
         if (metadata.thread.historyMode === "legacy") {
-            const legacy = await this.codexClient.threadRead({threadId: sessionId, includeTurns: true});
-            return oneItemPage(legacy.thread.turns.flatMap(turn => turn.items));
+            return {thread: metadata.thread, items: legacyHistoryItems(this.codexClient, sessionId)};
         }
-        return this.codexClient.threadItemPages(sessionId);
+        const entries = this.codexClient.threadItemEntryPages(sessionId);
+        return {thread: metadata.thread, items: completedHistoryItems(entries)};
+    }
+
+    restoreSubagentSubscription(rootSessionId: string, parentThreadId: string, thread: Thread): Promise<Thread | null> {
+        return this.subagents.restoreChild(rootSessionId, parentThreadId, thread);
     }
 
     async newSession(request: WithAcpMcpServers<acp.NewSessionRequest>): Promise<SessionMetadata> {
@@ -1283,6 +1291,20 @@ export class CodexAcpClient {
             if (!queue) return;
             await queue;
         }
+    }
+
+    /** Serializes a setup transition with the notifications it changes routing for. */
+    enqueueSessionTransition(sessionId: string, operation: () => void): Promise<void> {
+        return new Promise((resolve, reject) => {
+            this.enqueueSessionNotification(sessionId, () => {
+                try {
+                    operation();
+                    resolve();
+                } catch (error) {
+                    reject(error);
+                }
+            });
+        });
     }
 
     private enqueueSessionNotification(sessionId: string, operation: () => void | Promise<void>): void {
@@ -1788,4 +1810,19 @@ async function* noItems<T>(): AsyncGenerator<T[]> {}
 
 async function* oneItemPage<T>(items: T[]): AsyncGenerator<T[]> {
     if (items.length > 0) yield items;
+}
+
+async function* completedHistoryItems(pages: AsyncIterable<ThreadItemEntry[]>): AsyncGenerator<SubagentHistoryItem[]> {
+    for await (const page of pages) {
+        yield page.map(({item, turnId, completedAtMs}) => ({
+            item, turnId, completed: "status" in item ? item.status !== "inProgress" : completedAtMs !== null,
+        }));
+    }
+}
+
+async function* legacyHistoryItems(client: CodexAppServerClient, threadId: string): AsyncGenerator<SubagentHistoryItem[]> {
+    const {thread} = await client.threadRead({threadId, includeTurns: true});
+    yield thread.turns.flatMap(turn => turn.items.map(item => ({
+        item, turnId: turn.id, completed: "status" in item ? item.status !== "inProgress" : turn.status !== "inProgress",
+    })));
 }

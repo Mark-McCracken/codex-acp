@@ -15,6 +15,7 @@ import {
     OPENAI_PROVIDER_ID,
     type SessionMetadata,
     type SessionMetadataWithThread,
+    type SubagentHistoryItem,
     type UrlElicitationRequester
 } from "./CodexAcpClient";
 import {
@@ -650,7 +651,8 @@ export class CodexAcpServer {
         const release = (childId: string) => this.reportingConnection.reports.releaseOpen(childId);
         const router = this.usesStandardSubagents()
             ? new StandardSubagentEventRouter(sessionId, session, this.subagentAssociations, release, this.capabilities, replay,
-                this.sessions.get(sessionId)?.subagentTransition)
+                this.sessions.get(sessionId)?.subagentTransition,
+                threadId => this.codexAcpClient.appServerClient.runningTurnId(threadId))
             : new CodexSubagentEventRouter(sessionId, this.supportsNativeSubagents(), session, release);
         if (router instanceof StandardSubagentEventRouter) this.getSubagentInteractionHandlers(router, sessionId);
         return router;
@@ -1101,14 +1103,20 @@ export class CodexAcpServer {
         }
     }
 
-    private beginSessionOpen(sessionId: string): number {
-        const subagents = this.sessions.get(sessionId)?.subagents;
-        if (subagents instanceof StandardSubagentEventRouter) subagents.pauseForSetup();
+    private async beginSessionOpen(sessionId: string): Promise<number> {
         const generation = this.getSessionGeneration(sessionId);
-        if (this.sessionIsClosing(sessionId)) {
-            throw RequestError.invalidRequest(`Session ${sessionId} is closing`);
-        }
-        this.sessionOpenGenerations.set(sessionId, generation);
+        const begin = () => {
+            if (this.sessionIsClosing(sessionId)) throw RequestError.invalidRequest(`Session ${sessionId} is closing`);
+            if (this.getSessionGeneration(sessionId) !== generation) {
+                throw RequestError.invalidRequest(`Session ${sessionId} closed while setup was queued`);
+            }
+            const subagents = this.sessions.get(sessionId)?.subagents;
+            if (subagents instanceof StandardSubagentEventRouter) subagents.pauseForSetup();
+            this.sessionOpenGenerations.set(sessionId, generation);
+        };
+        // An admitted child event finishes before replay changes its publication boundary.
+        if (this.usesStandardSubagents()) await this.codexAcpClient.enqueueSessionTransition(sessionId, begin);
+        else begin();
         return generation;
     }
 
@@ -1207,7 +1215,7 @@ export class CodexAcpServer {
         const existingSessionRequest = request as WithAcpMcpServers<acp.ResumeSessionRequest> | WithAcpMcpServers<acp.ForkSessionRequest>;
         const previousInstructions = "sessionId" in request ? this.sessions.get(request.sessionId)?.instructions : undefined;
         const requestedSessionGeneration = operation === "resume"
-            ? this.beginSessionOpen(existingSessionRequest.sessionId)
+            ? await this.beginSessionOpen(existingSessionRequest.sessionId)
             : null;
         const knownAccount = await this.checkAuthorization();
         const requestedMcpServers = request.mcpServers ?? [];
@@ -1288,7 +1296,7 @@ export class CodexAcpServer {
             }
             throw err;
         }
-        const sessionGeneration = requestedSessionGeneration ?? this.beginSessionOpen(sessionId);
+        const sessionGeneration = requestedSessionGeneration ?? await this.beginSessionOpen(sessionId);
         if (!this.sessionOpenCanInstall(sessionId, sessionGeneration)) {
             settleTrackerReady?.(null);
             resumeSubscribed = false;
@@ -3296,7 +3304,7 @@ export class CodexAcpServer {
     }> {
         clientSystemPromptText(request.systemPrompt);
         const previousInstructions = this.sessions.get(request.sessionId)?.instructions;
-        const requestedSessionGeneration = this.beginSessionOpen(request.sessionId);
+        const requestedSessionGeneration = await this.beginSessionOpen(request.sessionId);
         const loadStartedAt = performance.now();
         const graceLeftMs = () => ACCOUNT_READ_LOAD_GRACE_MS - (performance.now() - loadStartedAt);
         const authStatusVersionAtStart = this.authStatusVersion;
@@ -3480,7 +3488,7 @@ export class CodexAcpServer {
             isOpen,
         );
         if (this.usesStandardSubagents()) {
-            await this.streamStandardThreadHistory(sessionId, itemPages, sessionState, new Set([sessionId]), isOpen);
+            await this.streamStandardThreadHistory(sessionId, standardHistoryItems(itemPages), sessionState, new Set([sessionId]), isOpen);
             return;
         }
         if (this.supportsNativeSubagents()) {
@@ -3661,7 +3669,7 @@ export class CodexAcpServer {
 
     private async streamStandardThreadHistory(
         sessionId: string,
-        itemPages: AsyncIterable<ThreadItem[]>,
+        itemPages: AsyncIterable<SubagentHistoryItem[]>,
         sessionState: SessionState,
         ancestry: Set<string>,
         isOpen: () => boolean,
@@ -3672,25 +3680,33 @@ export class CodexAcpServer {
         if (!(router instanceof StandardSubagentEventRouter)) return;
         const session = new ACPSessionConnection(this.connection, sessionId);
         const started = new Set<string>();
-        const replayChild = async (item: ThreadItem & {type: "subAgentActivity"}) => {
-            if (isRootAgentPath(item.agentPath) || ancestry.has(item.agentThreadId)) return;
-            const childId = await router.announceHistory(item.agentThreadId, item.agentPath);
-            if (childId === null || replayedChildren.has(item.agentThreadId)) return;
-            replayedChildren.add(item.agentThreadId);
+        const replayChild = async (childThreadId: string, childId: string | null) => {
+            if (childId === null || ancestry.has(childThreadId) || replayedChildren.has(childThreadId)) return;
+            replayedChildren.add(childThreadId);
             try {
-                const history = await this.codexAcpClient.readSessionItems(item.agentThreadId);
+                const history = await this.codexAcpClient.readSessionItems(childThreadId);
+                if (!isOpen()) throw new SessionClosedDuringLoadError();
+                const parentThreadId = router.parentThreadId(childThreadId);
+                if (parentThreadId !== undefined) {
+                    try {
+                        const runtime = await this.codexAcpClient.restoreSubagentSubscription(sessionState.sessionId, parentThreadId, history.thread);
+                        if (runtime) await router.restoreRuntime(runtime, this.codexAcpClient.appServerClient.runningTurnId(childThreadId));
+                    } catch (error) {
+                        logger.error(`Failed to restore subagent subscription ${childThreadId}`, error);
+                    }
+                }
                 await this.streamStandardThreadHistory(
-                    childId, history, sessionState, new Set([...ancestry, item.agentThreadId]),
-                    isOpen, item.agentThreadId, replayedChildren,
+                    childId, history.items, sessionState, new Set([...ancestry, childThreadId]),
+                    isOpen, childThreadId, replayedChildren,
                 );
             } catch (error) {
                 if (error instanceof SessionClosedDuringLoadError) throw error;
-                logger.error(`Failed to replay subagent ${item.agentThreadId}`, error);
+                logger.error(`Failed to replay subagent ${childThreadId}`, error);
             }
         };
         const unresolved: Array<ThreadItem & {type: "subAgentActivity"}> = [];
         for await (const items of itemPages) {
-            for (const item of items) {
+            for (const {item, completed, turnId} of items) {
                 if (!isOpen()) throw new SessionClosedDuringLoadError();
                 // Native child input comes from agents, not ordinary client user messages.
                 if (threadId !== sessionState.sessionId && item.type === "userMessage") continue;
@@ -3698,28 +3714,32 @@ export class CodexAcpServer {
                     if (item.senderThreadId === threadId) {
                         for (const child of item.receiverThreadIds) {
                             if (child.trim() && !ancestry.has(child)) {
-                                await router.announce(child, sessionId, undefined, item.prompt ?? undefined);
+                                const childId = await router.announce(child, sessionId, undefined, item.prompt ?? undefined);
+                                await replayChild(child, childId);
                             }
                         }
                     }
                     continue;
                 }
                 if (item.type === "subAgentActivity") {
-                    await replayChild(item);
+                    if (isRootAgentPath(item.agentPath) || ancestry.has(item.agentThreadId)) continue;
+                    await replayChild(item.agentThreadId, await router.announceHistory(item.agentThreadId, item.agentPath));
                     if (!replayedChildren.has(item.agentThreadId)) unresolved.push(item);
                     continue;
                 }
-                const partial = "status" in item && item.status === "inProgress";
+                const partial = !completed;
                 // Running commands may overlap buffered live output; replay their metadata, not bytes twice.
                 const replayItem = item.type === "commandExecution" && partial ? {...item, aggregatedOutput: null} : item;
                 for (const update of await this.createHistoryUpdates(replayItem, sessionState)) {
                     if (this.protocolVersion === 2) await this.sendReplayMessageStart(session, update, started);
                     await session.update(update);
                 }
-                if (threadId !== sessionState.sessionId && !partial) router.rememberReplayedItem(threadId, item.id);
+                if (threadId !== sessionState.sessionId) router.reconcileHistoryItem(threadId, item, completed, turnId);
             }
         }
-        for (const item of unresolved) await replayChild(item);
+        for (const item of unresolved) {
+            await replayChild(item.agentThreadId, await router.announceHistory(item.agentThreadId, item.agentPath));
+        }
         if (!isOpen()) throw new SessionClosedDuringLoadError();
         // History-only children have no confirmed current state or enabled mutations.
     }
@@ -5517,6 +5537,12 @@ async function* withoutReviewerPrompts(pages: AsyncIterable<ThreadItemEntry[]>):
 async function* itemsOfEntries(pages: AsyncIterable<ThreadItemEntry[]>): AsyncGenerator<ThreadItem[]> {
     for await (const page of pages) {
         yield page.map(entry => entry.item);
+    }
+}
+
+async function* standardHistoryItems(pages: AsyncIterable<ThreadItem[]>): AsyncGenerator<SubagentHistoryItem[]> {
+    for await (const page of pages) {
+        yield page.map(item => ({item, completed: !("status" in item) || item.status !== "inProgress"}));
     }
 }
 

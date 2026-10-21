@@ -2,7 +2,7 @@ import * as acp from "@agentclientprotocol/sdk/unstable";
 import * as acpV2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {spawn} from "node:child_process";
 import {once} from "node:events";
-import {appendFileSync, mkdirSync, mkdtempSync} from "node:fs";
+import {appendFileSync, mkdirSync, mkdtempSync, writeFileSync} from "node:fs";
 import {join} from "node:path";
 import {Readable, Writable} from "node:stream";
 import {expect, it, vi} from "vitest";
@@ -12,7 +12,7 @@ import {functionCallResponse, startMockResponsesServer, textResponse} from "./mo
 
 describeIntegration("integration: standard subagent sessions", () => {
     it.each(([1, 2] as const).flatMap(version =>
-        (["complete", "cancel", "close"] as const).map(ending => ({version, ending})),
+        (["complete", "cancel", "close", "terminal"] as const).map(ending => ({version, ending})),
     ))("replays active Codex children through ACP v$version ($ending)", async ({version, ending}) => {
         const mock = await startMockResponsesServer();
         let delegated = false;
@@ -25,6 +25,12 @@ describeIntegration("integration: standard subagent sessions", () => {
             if (!childRequested && agentName === "/root/worker") {
                 childRequested = true;
                 await childResponse;
+                if (ending === "terminal") {
+                    const script = "console.log('STREAM_BEFORE');const t=setInterval(()=>{if(require('fs').existsSync('release-child')){console.log('STREAM_AFTER');clearInterval(t)}},25)";
+                    return functionCallResponse("worker-command", "exec_command", {
+                        cmd: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`, yield_time_ms: 30_000,
+                    });
+                }
                 return textResponse("CHILD_RESULT");
             }
             const model = (request as {model?: string}).model;
@@ -54,7 +60,8 @@ describeIntegration("integration: standard subagent sessions", () => {
         });
         appendFileSync(join(codexHome, "config.toml"), "\nfeatures.multi_agent = true\nfeatures.multi_agent_v2 = true\n");
         const child = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
-            cwd: process.cwd(), env: {...process.env, CODEX_HOME: codexHome}, stdio: ["pipe", "pipe", "pipe"],
+            cwd: process.cwd(), env: {...process.env, CODEX_HOME: codexHome,
+                ...(ending === "terminal" ? {INITIAL_AGENT_MODE: "workspace-write"} : {})}, stdio: ["pipe", "pipe", "pipe"],
         });
         let stderr = "";
         child.stderr.on("data", chunk => { stderr += chunk.toString(); });
@@ -96,6 +103,14 @@ describeIntegration("integration: standard subagent sessions", () => {
             const state = (entry: typeof updates[number]) => version === 1
                 ? entry.update.sessionUpdate === "subagent_update" && entry.update.sessionId === childId ? entry.update.state : undefined
                 : entry.sessionId === childId && entry.update.sessionUpdate === "state_update" ? entry.update : undefined;
+            const output = (entry: typeof updates[number]): string => {
+                if (entry.sessionId !== childId) return "";
+                if (version === 2 && entry.update.sessionUpdate === "terminal_output_chunk") {
+                    return Buffer.from(entry.update.data, "base64").toString("utf8");
+                }
+                const chunk = entry.update._meta?.terminal_output_delta ?? entry.update._meta?.terminal_output;
+                return typeof chunk?.data === "string" ? chunk.data : "";
+            };
             await vi.waitFor(() => expect(updates.some(entry => state(entry)?.state === "running")).toBe(true));
             await prompt;
             if (version === 2) {
@@ -116,6 +131,28 @@ describeIntegration("integration: standard subagent sessions", () => {
                 expect(forkChildren.length, JSON.stringify(updates)).toBeGreaterThan(0);
                 expect(forkChildren.every(entry => entry.update.sessionId !== childId)).toBe(true);
                 await request("session/close", {sessionId: fork.sessionId});
+            } else if (ending === "terminal") {
+                releaseChild();
+                await vi.waitFor(() => expect(updates.some(entry => entry.sessionId === childId && (version === 2
+                    ? entry.update.sessionUpdate === "terminal_update" && typeof entry.update.command === "string"
+                    : entry.update._meta?.terminal_info)), JSON.stringify({
+                    stderr, updates: updates.filter(entry => entry.sessionId === childId),
+                    outputs: mock.requests.flatMap(request => ((request as {input?: Array<{type: string; output?: unknown}>}).input ?? [])
+                        .filter(item => item.type === "function_call_output").map(item => item.output)),
+                })).toBe(true), {timeout: 15_000});
+                await request("session/prompt", {sessionId, prompt: [{type: "text", text: "Continue parent independently"}]});
+                if (version === 2) {
+                    await vi.waitFor(() => expect(updates.filter(entry => entry.sessionId === sessionId
+                        && entry.update.sessionUpdate === "state_update").at(-1)?.update.state).toBe("idle"));
+                }
+                const terminalStart = updates.length;
+                writeFileSync(join(cwd, "release-child"), "");
+                await vi.waitFor(() => {
+                    expect(updates.slice(terminalStart).some(entry => output(entry).includes("STREAM_AFTER"))).toBe(true);
+                    expect(updates.slice(terminalStart).some(entry => entry.sessionId === childId && (version === 2
+                        ? entry.update.sessionUpdate === "terminal_update" && entry.update.exitStatus?.exitCode === 0
+                        : entry.update._meta?.terminal_exit?.exit_code === 0))).toBe(true);
+                }, {timeout: 15_000});
             } else {
                 if (ending === "cancel") await context.notify("session/cancel", {sessionId});
                 else await request("session/close", {sessionId});
@@ -126,7 +163,7 @@ describeIntegration("integration: standard subagent sessions", () => {
                 }), `${stderr}\n${JSON.stringify(updates)}`).toBe(true), {timeout: 15_000});
             }
             releaseChild();
-            if (ending === "complete") await vi.waitFor(() => {
+            if (ending === "complete" || ending === "terminal") await vi.waitFor(() => {
                 const child = updates.find(entry => entry.sessionId === sessionId && entry.update.sessionUpdate === "subagent_update");
                 const requests = mock.requests.map(request => {
                     const body = request as {model?: string; tools?: Array<{name?: string; type?: string}>; input?: Array<{type?: string}>};
@@ -146,6 +183,7 @@ describeIntegration("integration: standard subagent sessions", () => {
             expect(updates.some(entry => ["subagent_spawned", "subagent_state_update", "_subagent_update"].includes(entry.update.sessionUpdate))).toBe(false);
             expect(mock.unexpectedRequests).toBe(0);
         } finally {
+            writeFileSync(join(cwd, "release-child"), "");
             releaseChild();
             connection.close();
             child.kill("SIGTERM");

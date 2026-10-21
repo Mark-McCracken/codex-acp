@@ -199,6 +199,8 @@ Work state is independent of conversation lifetime. An observed work ending repo
 its stop reason, not a permanently completed child. Lost observability reports `unknown`, not a
 fabricated failure. On v2, the same state also appears on the child's own `state_update` stream.
 Child work, plans, permissions, and elicitation can outlive the parent's foreground prompt.
+Child item-rendering state is conversation-owned too, so a new parent prompt does not reset
+an active child's terminal or streamed item tracking.
 Child Markdown plans use completed snapshots rather than interim draft deltas.
 Parent cancellation interrupts observed descendant work and withdraws child interactions; late
 answers cannot restart finished work. Closing or replacing the runtime invalidates those scopes.
@@ -209,6 +211,11 @@ Responding to child-scoped Agent-to-Client requests is still allowed. Replayed a
 transcripts do not grant controls or confirm current activity; overlapping completed items are
 deduplicated and fresh work snapshots follow the replay response. A copied history alone never
 authorizes interrupting the original child runtime.
+Restored child routes require provider-confirmed parentage through the verified ancestor chain.
+Only already-loaded runtimes are rejoined; inactive owned children are not loaded just for replay,
+but their routes can receive later live work. Foreign or unverified fork descendants stay history-only.
+Child history uses the same traversal for both Codex spawn formats and reconciles completed
+items with live tool tracking before suppressing overlapping notifications.
 Load/resume attachment operations for the same standard parent are serialized. Fresh child
 traffic follows the actual response write, including when the response is part of a batch;
 overlapping attachments publish after the latest setup's response rather than interleaving
