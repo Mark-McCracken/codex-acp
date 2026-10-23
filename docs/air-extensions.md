@@ -1236,7 +1236,8 @@ ID-mismatched records are omitted. Merge returned rows with the recent page by
 `sessionId`; an omitted ID need not remove its pinned or folder reference.
 
 `{ "sessionIds": [] }` returns `{ "sessions": [] }` without reading the store.
-Store-wide root, discovery, database and transport failures reject the request.
+Store-wide discovery, database and transport failures reported by the app-server
+reject the request.
 
 Rows use the same builder as an unscoped `session/list`, including archive,
 worktree and activity metadata. Codex selects the stored copy. The adapter calls

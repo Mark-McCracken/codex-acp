@@ -1,9 +1,6 @@
 import {afterEach, describe, expect, it, vi} from "vitest";
 import * as acp from "@agentclientprotocol/sdk/unstable";
 import * as acpV2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import {createAcpAgentRouter} from "../../AcpAgentRouter";
 import {CodexAcpServer} from "../../CodexAcpServer";
 import {CodexAcpClient} from "../../CodexAcpClient";
@@ -16,10 +13,8 @@ afterEach(() => cleanup.splice(0).reverse().forEach(dispose => dispose()));
 
 async function connect(version: 1 | 2, capabilities: string[]) {
     const mocks = createMockConnections();
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-batch-wire-"));
-    cleanup.push(() => fs.rmSync(home, {recursive: true, force: true}));
     mocks.mockCodexConnection.sendRequest.mockImplementation(async (method: string, params: any) => {
-        if (method === "initialize") return {codexHome: home};
+        if (method === "initialize") return {};
         if (method === "thread/read") throw Object.assign(new Error(`invalid thread id: ${params.threadId}`), {code: -32600});
         return {};
     });

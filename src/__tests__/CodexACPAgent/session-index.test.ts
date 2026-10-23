@@ -1337,9 +1337,6 @@ describe("_session/batch_get", () => {
     const roots: string[] = [];
     afterEach(() => {
         for (const root of roots.splice(0)) {
-            for (const child of [root, path.join(root, "sessions"), path.join(root, "archived_sessions")]) {
-                try { fs.chmodSync(child, 0o700); } catch {}
-            }
             fs.rmSync(root, {recursive: true, force: true});
         }
     });
@@ -1442,23 +1439,16 @@ describe("_session/batch_get", () => {
         await expect(agent.sessionIndex.batchGet({sessionIds: ["CANONICAL"]})).rejects.toBe(error);
     });
 
-    it.skipIf(process.platform === "win32")("rejects unreadable, invalid or dangling store roots before any lookup, even after a successful batch", async () => {
-        const {agent, read, root} = await setup();
+    it.each([null, "missing", "file"] as const)("accepts app-server metadata when the local home is %s", async localHome => {
+        const {agent, client, read, root} = await setup();
+        const home = localHome === null ? null : path.join(root, localHome);
+        if (localHome === "file") fs.writeFileSync(home!, "not a directory");
+        vi.spyOn(client, "getHomePath").mockReturnValue(home);
         read.mockResolvedValue({thread: createThread()});
-        await agent.sessionIndex.batchGet({sessionIds: [threadId]});
-        read.mockClear();
-        const sessions = path.join(root, "sessions");
-        fs.mkdirSync(sessions);
-        fs.chmodSync(sessions, 0);
-        await expect(agent.sessionIndex.batchGet({sessionIds: [threadId]})).rejects.toMatchObject({code: "EACCES"});
-        fs.chmodSync(sessions, 0o700);
-        fs.rmdirSync(sessions);
-        fs.writeFileSync(sessions, "not a directory");
-        await expect(agent.sessionIndex.batchGet({sessionIds: [threadId]})).rejects.toMatchObject({code: -32603});
-        fs.unlinkSync(sessions);
-        fs.symlinkSync(path.join(root, "absent"), sessions);
-        await expect(agent.sessionIndex.batchGet({sessionIds: [threadId]})).rejects.toMatchObject({code: "ENOENT"});
-        expect(read).not.toHaveBeenCalled();
+        const result = await agent.sessionIndex.batchGet({sessionIds: [threadId]});
+        expect(result.sessions.map(row => row.sessionId)).toEqual([threadId]);
+        expect(read).toHaveBeenCalledExactlyOnceWith({threadId, includeTurns: false});
+        agent.sessionIndex.dispose();
     });
 
     it("does not emit a backend-normalized ID that was not requested", async () => {
