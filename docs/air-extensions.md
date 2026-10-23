@@ -146,8 +146,8 @@ The `initialize` response carries the agent side of the extension only when the 
 The agent list does not depend on the client capability list, except for `sessionIndex`.
 The agent lists `sessionIndex` only when the client declared it, because AIR builds without it use
 `session/list` and `session/delete` the old way. Exactly then it also lists `sessionArchive`, `sessionRename`,
-`sessionListSubscribe` and `sessionWorktrees`, which name requests and row fields of the session index; the client
-does not declare those four, and declaring them without `sessionIndex` enables nothing.
+`sessionBatchGet`, `sessionListSubscribe` and `sessionWorktrees`, which name requests and row fields of the session index; the client
+does not declare those five, and declaring them without `sessionIndex` enables nothing.
 An extension is active only when the client declared its capability.
 A client that is not AIR gets no `jetbrains` key and no `goal` key in the `initialize` response.
 
@@ -166,10 +166,11 @@ A client that is not AIR gets no `jetbrains` key and no `goal` key in the `initi
 | `codexHooks` | Lets AIR review and trust startup hooks before it opens a session. | [Hook trust](#hook-trust) |
 | `sessionIndex` | Serves `session/list` as the session index of AIR, as the ACP session list extensions RFD and RFD #2161 describe, adds rename and archive requests, and pushes the changed rows of a cwd to a subscription. | [Session index](#session-index) |
 
-Four agent capabilities come with `sessionIndex` and are listed exactly when it is. The client does not declare them:
+Five agent capabilities come with `sessionIndex` and are listed exactly when it is. The client does not declare them:
 
 | Agent capability | What it tells the client | Section |
 | --- | --- | --- |
+| `sessionBatchGet` | Reads metadata for known session IDs with `_session/batch_get`. | [Batch get](#batch-get) |
 | `sessionArchive` | The agent serves `_session/archive` and `_session/unarchive`. | [Requests](#requests) |
 | `sessionRename` | The agent serves `_session/rename`. | [Requests](#requests) |
 | `sessionListSubscribe` | The agent serves `_session/list/subscribe` and `_session/list/unsubscribe` and sends `_session/list/changes`. | [Session list subscription](#session-list-subscription) |
@@ -1007,7 +1008,7 @@ This section covers only the AIR bridge.
 
 AIR uses `session/list` as its index of Codex threads when it declares `sessionIndex`.
 Everything in this section applies only to such a client. The `initialize` answer to it lists `sessionIndex`,
-`sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees` in `_meta.jetbrains.air.capabilities`.
+`sessionBatchGet`, `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees` in `_meta.jetbrains.air.capabilities`.
 Another client, AIR included, keeps the old `session/list`, `session/delete` and `initialize` answers.
 ACP v1 and v2 connections get the same session index.
 
@@ -1190,6 +1191,97 @@ A thread that is not loaded here has no `state`. A change of `state` is a row ch
   archiving the thread: old AIR builds send `session/delete` for "Done". Threads they closed that way show as
   archived to a `sessionIndex` client.
 
+### Batch get
+
+`_session/batch_get` reads metadata for known session IDs, including pinned sessions
+and folder members outside the recent list page. AIR must check for
+`sessionBatchGet` in `initialize.result._meta.jetbrains.air.capabilities` before
+calling it. This is an AIR extension; the base ACP schema and SDK are unchanged.
+
+The params object must contain only `sessionIds`: an array of 0–100 distinct,
+non-empty strings. IDs match exactly, without trimming or case normalization.
+Malformed params, duplicates, more than 100 IDs, or extra fields return
+`Invalid params` (`-32602`). There is no `cwd`, `archived`, `includeWorktrees`,
+`limit`, pagination or cursor. Archived sessions and sessions in other projects
+or worktrees are eligible; AIR applies display filters itself.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "_session/batch_get",
+  "params": { "sessionIds": ["oldA", "oldB", "oldC"] }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "sessions": [
+      {
+        "sessionId": "oldA",
+        "cwd": "/project",
+        "title": "Fix the build",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "_meta": { "jetbrains": { "air": { "version": 1, "archived": false } } }
+      }
+    ],
+    "missing": ["oldC"],
+    "errors": [
+      {
+        "sessionId": "oldB",
+        "code": "unavailable",
+        "message": "Session metadata could not be read"
+      }
+    ]
+  }
+}
+```
+
+The example IDs stand for Codex thread IDs; `oldC` represents a native UUID
+parse rejection, the only positively confirmed absence available here. Every requested
+ID appears in exactly one result bucket:
+
+- `sessions` contains full `session/list` rows, including `_meta.jetbrains.air`,
+  in request order. It uses the same row builder as `session/list` without `cwd`, with every archive
+  state included. Codex selects the current stored copy; the adapter does not
+  combine rollout files itself.
+- `missing` contains IDs confirmed to have no record in the store. Absence does
+  not authorize automatic pin or folder cleanup: AIR keeps those references and
+  may show them as unavailable.
+- `errors` contains `{ sessionId, code: "unavailable", message?: string }` for
+  records that exist or may exist but cannot supply metadata. Unreadable records
+  never become `missing`. This includes corrupt or unreadable metadata and ambiguous absence from Codex.
+  A native UUID parse rejection confirms `missing`; a valid but unknown UUID
+  usually produces `unavailable`. Codex can also report an existing indexed
+  record with an inaccessible selected rollout as not loaded, so that response
+  cannot confirm absence. The `missing` array may therefore be empty even when
+  requested valid UUIDs have no stored record.
+
+`{ "sessionIds": [] }` returns `{ "sessions": [], "missing": [], "errors": [] }`
+without reading the store. The operation is not atomic: individual failures go
+in `errors`; a store-wide failure, such as an unreadable session-store root, rejects
+the request. Each result bucket preserves the relative request order.
+
+The adapter calls the supported Codex `thread/read` with `includeTurns: false`
+for each requested ID. It does not load or resume sessions, page through
+`thread/list`, or request turn history. However, Codex 0.164 can internally fall
+back to recursive filesystem discovery for unknown or unindexed IDs, and can
+read rollout metadata for legacy threads. Its work and latency can therefore
+depend on total stored history. This extension does not promise history-independent
+lookup latency. Native legacy `thread/read` metadata can also have a creation-based
+`updatedAt` where `thread/list` reports the stored update time. The row builder
+and selected copy are shared, but exact timestamp equality is not guaranteed.
+No private SQLite schema is accessed by the adapter.
+
+The adapter checks store root access before reading. Store-wide root, discovery,
+database and transport failures reject the request; per-record and uncertain
+failures remain `unavailable`. Merge successful rows with the recent page by
+`sessionId`; keep missing and failed IDs pinned. A batch read does not subscribe
+to changes or expand an existing subscription's scope.
+
 ### Session list subscription
 
 The client subscribes to the rows of a cwd and the agent pushes the rows that change. It is best effort: the client
@@ -1211,6 +1303,9 @@ still re-reads the list now and then, and a lost change shows up there.
   The agent resolves the worktrees of a subscription again every 10 s, and at most once a second for a changed
   thread whose cwd is not in its scope. A thread of a worktree created less than a second before its change can
   show only with its next change.
+- There is no page or recent-session limit: changes to older pinned or folder sessions within that scope
+  are reported even outside the page AIR loaded. Pinned IDs outside the subscribed project and worktrees
+  are not tracked; `_session/batch_get` does not expand the scope. Subscribe to their project or refresh explicitly.
 - `_session/list/changes` carries, for each thread in scope that appeared or changed, its whole row exactly as
   `session/list` answers it. A row counts as changed when `title`, `lastPromptAt`, `state`, `lastTurnEndedAt`,
   `model`, `forkedFrom`, `archived` or `agentWorktree` differs from the row the subscription last got. A change of
@@ -1263,6 +1358,7 @@ The names and the semantics are the RFDs'. The transport differs:
 
 | Extension | RFD |
 | --- | --- |
+| capability `sessionBatchGet`, `_session/batch_get` | none |
 | capability `sessionIndex` in `_meta.jetbrains.air.capabilities` | `sessionCapabilities.list.limit` |
 | agent capability `sessionArchive` | agent capability `archive` (#2161): `sessionCapabilities.archive`, `capabilities.session.archive` in v2 |
 | agent capability `sessionRename` | the rename capability of RFD #1987, which it spells `sessionCapabilities.setTitle` |
