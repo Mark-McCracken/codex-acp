@@ -1417,23 +1417,30 @@ describe("_session/batch_get", () => {
         Object.assign(new Error("thread not loaded: known"), {code: -32600}),
         Object.assign(new Error("no rollout found for thread id known"), {code: -32600}),
         Object.assign(new Error("Permission denied reading one rollout"), {code: -32603}),
+        Object.assign(new Error("failed to locate thread id canonical: Permission denied"), {code: -32600}),
+        Object.assign(new Error("failed to locate archived thread id canonical: Permission denied"), {code: -32600}),
+        Object.assign(new Error("failed to read thread: thread-store internal error: failed to read thread metadata for canonical: database is locked"), {code: -32603}),
+        Object.assign(new Error("New upstream wording"), {code: -32600}),
+        Object.assign(new Error("New upstream wording"), {code: -32603}),
         new Error("unexpected backend failure"),
-    ])("omits unreadable or absent metadata: %s", async error => {
+    ])("omits failed metadata reads and continues in request order: %s", async error => {
         const {agent, read} = await setup();
+        const before = createThread({id: "before"});
+        const after = createThread({id: "after"});
+        read.mockResolvedValueOnce({thread: before}).mockRejectedValueOnce(error).mockResolvedValueOnce({thread: after});
+        const result = await agent.sessionIndex.batchGet({sessionIds: [before.id, "CANONICAL", after.id]});
+        expect(result.sessions.map(row => row.sessionId)).toEqual([before.id, after.id]);
         read.mockRejectedValue(error);
         expect(await agent.sessionIndex.batchGet({sessionIds: ["known"]})).toEqual({sessions: []});
     });
 
     it.each([
-        Object.assign(new Error("failed to locate thread id canonical: Permission denied"), {code: -32600}),
-        Object.assign(new Error("failed to locate archived thread id canonical: Permission denied"), {code: -32600}),
-        Object.assign(new Error("failed to read thread: thread-store internal error: failed to read thread metadata for canonical: database is locked"), {code: -32603}),
         Object.assign(new Error("Pending response rejected since connection got disposed"), {code: -32097}),
         Object.assign(new Error("Connection is inactive"), {code: -32096}),
         Object.assign(new Error("failed to send"), {code: -32099}),
-        Object.assign(new Error("server is shutting down"), {code: -32600, data: {reason: "serverShuttingDown"}}),
+        Object.assign(new Error("New upstream wording"), {code: -32600, data: {reason: "serverShuttingDown"}}),
         new acp.RequestError(1001, "Codex process has exited"),
-    ])("rejects store-wide failure, including normalized native IDs: %s", async error => {
+    ])("rejects connection, process and shutdown failures: %s", async error => {
         const {agent, read} = await setup();
         read.mockRejectedValue(error);
         await expect(agent.sessionIndex.batchGet({sessionIds: ["CANONICAL"]})).rejects.toBe(error);

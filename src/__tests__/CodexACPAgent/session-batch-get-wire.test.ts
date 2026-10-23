@@ -73,6 +73,16 @@ describe.each([1, 2] as const)("_session/batch_get over ACP v%i", version => {
         expect(backend).not.toHaveBeenCalled();
     });
 
+    it.each([
+        {code: -32600, message: "failed to locate thread id known: Permission denied"},
+        {code: -32603, message: "failed to read thread: thread-store internal error: failed to read thread metadata for known: database is locked"},
+    ])("omits native metadata failures with code $code", async error => {
+        const {request, backend} = await connect(version, ["sessionIndex"]);
+        backend.mockRejectedValue(Object.assign(new Error(error.message), {code: error.code}));
+        expect(await request(SESSION_BATCH_GET_METHOD, {sessionIds: ["known"]})).toEqual({sessions: []});
+        expect(backend).toHaveBeenCalledExactlyOnceWith("thread/read", {threadId: "known", includeTurns: false});
+    });
+
     it("accepts 100 distinct exact strings without trimming or normalization", async () => {
         const {request, backend} = await connect(version, ["sessionIndex"]);
         const ids = ["id", "ID", " id ", ...Array.from({length: 97}, (_, index) => `id-${index}`)];

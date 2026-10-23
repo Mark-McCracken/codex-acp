@@ -1236,8 +1236,11 @@ ID-mismatched records are omitted. Merge returned rows with the recent page by
 `sessionId`; an omitted ID need not remove its pinned or folder reference.
 
 `{ "sessionIds": [] }` returns `{ "sessions": [] }` without reading the store.
-Store-wide discovery, database and transport failures reported by the app-server
-reject the request.
+Failed metadata reads omit the corresponding rows. Connection loss, process
+exit and the app-server's structured `serverShuttingDown` error reject the
+request. Native storage errors do not reliably distinguish one unreadable record
+from a wider storage failure, so a database or discovery failure can also produce
+an empty or partial result.
 
 Rows use the same builder as an unscoped `session/list`, including archive,
 worktree and activity metadata. Codex selects the stored copy. The adapter calls
