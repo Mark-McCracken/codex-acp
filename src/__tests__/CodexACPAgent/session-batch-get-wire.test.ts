@@ -51,7 +51,7 @@ describe.each([1, 2] as const)("_session/batch_get over ACP v%i", version => {
             if (capabilities.includes("sessionIndex")) {
                 expect(advertised).toContain("sessionBatchGet");
                 const ids = ["second", "first"];
-                expect(await request(SESSION_BATCH_GET_METHOD, {sessionIds: ids})).toEqual({sessions: [], missing: ids, errors: []});
+                expect(await request(SESSION_BATCH_GET_METHOD, {sessionIds: ids})).toEqual({sessions: []});
                 for (const forbidden of ["thread/list", "thread/resume", "thread/start", "thread/turns/list", "thread/items/list"]) {
                     expect(backend.mock.calls.map(([method]: [string]) => method)).not.toContain(forbidden);
                 }
@@ -74,7 +74,7 @@ describe.each([1, 2] as const)("_session/batch_get over ACP v%i", version => {
         for (const params of invalid) {
             await expect(request(SESSION_BATCH_GET_METHOD, params)).rejects.toMatchObject({code: -32602});
         }
-        expect(await request(SESSION_BATCH_GET_METHOD, {sessionIds: []})).toEqual({sessions: [], missing: [], errors: []});
+        expect(await request(SESSION_BATCH_GET_METHOD, {sessionIds: []})).toEqual({sessions: []});
         expect(backend).not.toHaveBeenCalled();
     });
 
@@ -82,7 +82,7 @@ describe.each([1, 2] as const)("_session/batch_get over ACP v%i", version => {
         const {request, backend} = await connect(version, ["sessionIndex"]);
         const ids = ["id", "ID", " id ", ...Array.from({length: 97}, (_, index) => `id-${index}`)];
         const result = await request(SESSION_BATCH_GET_METHOD, {sessionIds: ids});
-        expect(result).toEqual({sessions: [], missing: ids, errors: []});
+        expect(result).toEqual({sessions: []});
         expect(backend.mock.calls.filter(([method]: [string]) => method === "thread/read").map(([, params]: [unknown, any]) => params.threadId)).toEqual(ids);
     });
 });

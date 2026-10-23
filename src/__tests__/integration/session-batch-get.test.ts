@@ -55,8 +55,6 @@ describeIntegration("integration: session batch metadata", () => {
             const result = await index.batchGet({sessionIds: [archived, corrupt, old, absent, "not-a-uuid"]});
             expect(result.sessions.map(row => row.sessionId)).toEqual([archived, old]);
             expect(result.sessions[1]!.title).toBe("Selected current copy");
-            expect(result.missing).toEqual(["not-a-uuid"]);
-            expect(result.errors.map(error => error.sessionId)).toEqual([corrupt, absent]);
             const requests = fixture.getCodexConnectionEvents([]).filter(event => event.eventType === "request");
             expect(requests).toEqual([archived, corrupt, old, absent, "not-a-uuid"].map(threadId => ({
                 eventType: "request", method: "thread/read", params: {threadId, includeTurns: false},

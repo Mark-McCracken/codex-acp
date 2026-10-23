@@ -7,7 +7,7 @@ import type {CodexAppServerClient} from "./CodexAppServerClient";
 import {isConnectionDeathError} from "./app-server-recovery/AppServerRecovery";
 import {isAppServerUnavailableError} from "./app-server-recovery/AppServerExit";
 import {isArchivedRolloutPath} from "./SessionIndexMutations";
-import type {SessionBatchGetResponse, SessionIndexThread} from "./SessionIndex";
+import type {SessionIndexThread} from "./SessionIndex";
 
 /** Check roots without enumerating history. Missing roots are normal; inaccessible or dangling roots are not. */
 async function checkStoreRoots(codexHome: string | null): Promise<void> {
@@ -44,28 +44,19 @@ export async function readSessionBatchMetadata(
     client: CodexAppServerClient,
     codexHome: string | null,
     sessionIds: string[],
-): Promise<{entries: SessionIndexThread[]; missing: string[]; errors: SessionBatchGetResponse["errors"]}> {
+): Promise<SessionIndexThread[]> {
     await checkStoreRoots(codexHome);
     const entries: SessionIndexThread[] = [];
-    const missing: string[] = [];
-    const errors: SessionBatchGetResponse["errors"] = [];
     for (const sessionId of sessionIds) {
         try {
             const {thread} = await client.threadRead({threadId: sessionId, includeTurns: false});
             // UUID parsing can normalize the ID. Opaque ACP IDs must still match exactly.
-            if (thread.id !== sessionId) throw new Error("Codex returned a different session ID");
+            if (thread.id !== sessionId) continue;
             entries.push({thread, archived: thread.path !== null && isArchivedRolloutPath(thread.path, codexHome)});
         } catch (error) {
             if (client.connectionLoss.lost || storeReadFailed(error)) throw error;
-            const {code, message} = rpcError(error);
-            // Only the native ID parser proves that no stored Codex thread can have this ID.
-            // "no rollout found" also covers existing indexed records with inaccessible paths.
-            if (code === -32600 && typeof message === "string" && message.startsWith("invalid thread id: ")) {
-                missing.push(sessionId);
-            } else {
-                errors.push({sessionId, code: "unavailable", message: "Session metadata could not be read"});
-            }
+            // Unreadable or absent records contribute no row.
         }
     }
-    return {entries, missing, errors};
+    return entries;
 }

@@ -1193,17 +1193,15 @@ A thread that is not loaded here has no `state`. A change of `state` is a row ch
 
 ### Batch get
 
-`_session/batch_get` reads metadata for known session IDs, including pinned sessions
-and folder members outside the recent list page. AIR must check for
-`sessionBatchGet` in `initialize.result._meta.jetbrains.air.capabilities` before
-calling it. This is an AIR extension; the base ACP schema and SDK are unchanged.
+`_session/batch_get` refreshes known session IDs, such as pinned sessions and folder
+members outside the recent list page. Check for `sessionBatchGet` in
+`initialize.result._meta.jetbrains.air.capabilities` before calling it.
 
-The params object must contain only `sessionIds`: an array of 0–100 distinct,
+The params object contains only `sessionIds`: an array of 0–100 distinct,
 non-empty strings. IDs match exactly, without trimming or case normalization.
 Malformed params, duplicates, more than 100 IDs, or extra fields return
-`Invalid params` (`-32602`). There is no `cwd`, `archived`, `includeWorktrees`,
-`limit`, pagination or cursor. Archived sessions and sessions in other projects
-or worktrees are eligible; AIR applies display filters itself.
+`Invalid params` (`-32602`). Archived sessions and sessions in other projects
+or worktrees are eligible; the client applies display filters.
 
 ```json
 {
@@ -1227,60 +1225,30 @@ or worktrees are eligible; AIR applies display filters itself.
         "updatedAt": "2026-01-01T00:00:00.000Z",
         "_meta": { "jetbrains": { "air": { "version": 1, "archived": false } } }
       }
-    ],
-    "missing": ["oldC"],
-    "errors": [
-      {
-        "sessionId": "oldB",
-        "code": "unavailable",
-        "message": "Session metadata could not be read"
-      }
     ]
   }
 }
 ```
 
-The example IDs stand for Codex thread IDs; `oldC` represents a native UUID
-parse rejection, the only positively confirmed absence available here. Every requested
-ID appears in exactly one result bucket:
+The example IDs stand for Codex thread IDs. `sessions` contains full
+`session/list` rows in relative request order. Absent, unreadable, ambiguous and
+ID-mismatched records are omitted. Merge returned rows with the recent page by
+`sessionId`; an omitted ID need not remove its pinned or folder reference.
 
-- `sessions` contains full `session/list` rows, including `_meta.jetbrains.air`,
-  in request order. It uses the same row builder as `session/list` without `cwd`, with every archive
-  state included. Codex selects the current stored copy; the adapter does not
-  combine rollout files itself.
-- `missing` contains IDs confirmed to have no record in the store. Absence does
-  not authorize automatic pin or folder cleanup: AIR keeps those references and
-  may show them as unavailable.
-- `errors` contains `{ sessionId, code: "unavailable", message?: string }` for
-  records that exist or may exist but cannot supply metadata. Unreadable records
-  never become `missing`. This includes corrupt or unreadable metadata and ambiguous absence from Codex.
-  A native UUID parse rejection confirms `missing`; a valid but unknown UUID
-  usually produces `unavailable`. Codex can also report an existing indexed
-  record with an inaccessible selected rollout as not loaded, so that response
-  cannot confirm absence. The `missing` array may therefore be empty even when
-  requested valid UUIDs have no stored record.
+`{ "sessionIds": [] }` returns `{ "sessions": [] }` without reading the store.
+Store-wide root, discovery, database and transport failures reject the request.
 
-`{ "sessionIds": [] }` returns `{ "sessions": [], "missing": [], "errors": [] }`
-without reading the store. The operation is not atomic: individual failures go
-in `errors`; a store-wide failure, such as an unreadable session-store root, rejects
-the request. Each result bucket preserves the relative request order.
+Rows use the same builder as an unscoped `session/list`, including archive,
+worktree and activity metadata. Codex selects the stored copy. The adapter calls
+`thread/read` with `includeTurns: false` for each ID without loading or resuming
+sessions, paging through `thread/list`, or requesting turn history. A batch read
+does not subscribe to changes or expand an existing subscription's scope.
 
-The adapter calls the supported Codex `thread/read` with `includeTurns: false`
-for each requested ID. It does not load or resume sessions, page through
-`thread/list`, or request turn history. However, Codex 0.164 can internally fall
-back to recursive filesystem discovery for unknown or unindexed IDs, and can
-read rollout metadata for legacy threads. Its work and latency can therefore
-depend on total stored history. This extension does not promise history-independent
-lookup latency. Native legacy `thread/read` metadata can also have a creation-based
-`updatedAt` where `thread/list` reports the stored update time. The row builder
-and selected copy are shared, but exact timestamp equality is not guaranteed.
-No private SQLite schema is accessed by the adapter.
-
-The adapter checks store root access before reading. Store-wide root, discovery,
-database and transport failures reject the request; per-record and uncertain
-failures remain `unavailable`. Merge successful rows with the recent page by
-`sessionId`; keep missing and failed IDs pinned. A batch read does not subscribe
-to changes or expand an existing subscription's scope.
+Codex 0.164 can internally fall back to recursive filesystem discovery for
+unknown or unindexed IDs and read legacy rollout metadata, so lookup latency can
+depend on total stored history. Native legacy `thread/read` can also return a
+creation-based `updatedAt` where `thread/list` reports the stored update time;
+exact timestamp equality is not guaranteed.
 
 ### Session list subscription
 

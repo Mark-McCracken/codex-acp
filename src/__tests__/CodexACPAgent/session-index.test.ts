@@ -1375,18 +1375,13 @@ describe("_session/batch_get", () => {
 
         const batch = await agent.sessionIndex.batchGet({sessionIds: [linked.id, "corrupt", old.id, "invalid-native-id", archived.id, absent]});
         expect(batch.sessions.map(row => row.sessionId)).toEqual([linked.id, old.id, archived.id]);
-        expect(batch.missing).toEqual(["invalid-native-id"]);
-        expect(batch.errors).toEqual([
-            {sessionId: "corrupt", code: "unavailable", message: "Session metadata could not be read"},
-            {sessionId: absent, code: "unavailable", message: "Session metadata could not be read"},
-        ]);
         expect(threadList).not.toHaveBeenCalled();
         expect(read.mock.calls.map(([params]) => params)).toEqual([linked.id, "corrupt", old.id, "invalid-native-id", archived.id, absent]
             .map(threadId => ({threadId, includeTurns: false})));
         // A current stored copy is supplied by Codex, exactly as it is for list: no adapter copy scan/merge.
         threadList.mockImplementation(async params => ({data: rows.filter(row => (row.id === archived.id) === params.archived), nextCursor: null, backwardsCursor: null}));
         const all = await agent.listSessions({_meta: {jetbrains: {air: {list: {archived: "all"}}}}});
-        expect(batch.sessions).toEqual([linked.id, old.id, archived.id].map(id => all.sessions.find(row => row.sessionId === id)));
+        expect(batch).toEqual({sessions: [linked.id, old.id, archived.id].map(id => all.sessions.find(row => row.sessionId === id))});
         expect((batch.sessions[0]!._meta as any).jetbrains.air.agentWorktree).toBe(true);
         expect((batch.sessions[1]!._meta as any).jetbrains.air.state).toBe("running");
         expect((batch.sessions[2]!._meta as any).jetbrains.air.archived).toBe(true);
@@ -1415,7 +1410,7 @@ describe("_session/batch_get", () => {
     it("does no store or process work for empty input", async () => {
         const {agent, read, threadList, client} = await setup();
         const home = vi.spyOn(client, "getHomePath");
-        expect(await agent.sessionIndex.batchGet({sessionIds: []})).toEqual({sessions: [], missing: [], errors: []});
+        expect(await agent.sessionIndex.batchGet({sessionIds: []})).toEqual({sessions: []});
         expect(home).not.toHaveBeenCalled();
         expect(read).not.toHaveBeenCalled();
         expect(threadList).not.toHaveBeenCalled();
@@ -1424,14 +1419,12 @@ describe("_session/batch_get", () => {
     it.each([
         Object.assign(new Error("thread not loaded: known"), {code: -32600}),
         Object.assign(new Error("no rollout found for thread id known"), {code: -32600}),
-        Object.assign(new Error("wrapped invalid thread id: invalid character"), {code: -32600}),
-        Object.assign(new Error("invalid thread id: invalid character"), {code: -32603}),
         Object.assign(new Error("Permission denied reading one rollout"), {code: -32603}),
         new Error("unexpected backend failure"),
-    ])("keeps uncertain or per-record errors unavailable: %s", async error => {
+    ])("omits unreadable or absent metadata: %s", async error => {
         const {agent, read} = await setup();
         read.mockRejectedValue(error);
-        expect(await agent.sessionIndex.batchGet({sessionIds: ["known"]})).toEqual({sessions: [], missing: [], errors: [{sessionId: "known", code: "unavailable", message: "Session metadata could not be read"}]});
+        expect(await agent.sessionIndex.batchGet({sessionIds: ["known"]})).toEqual({sessions: []});
     });
 
     it.each([
@@ -1471,6 +1464,6 @@ describe("_session/batch_get", () => {
     it("does not emit a backend-normalized ID that was not requested", async () => {
         const {agent, read} = await setup();
         read.mockResolvedValue({thread: createThread()});
-        expect(await agent.sessionIndex.batchGet({sessionIds: [threadId.toUpperCase()]})).toMatchObject({sessions: [], missing: [], errors: [{sessionId: threadId.toUpperCase(), code: "unavailable"}]});
+        expect(await agent.sessionIndex.batchGet({sessionIds: [threadId.toUpperCase()]})).toEqual({sessions: []});
     });
 });

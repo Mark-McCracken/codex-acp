@@ -165,13 +165,13 @@ export class SessionIndexService {
     /** Metadata only: no adapter list paging, session load/resume or history replay. */
     async batchGet({sessionIds}: SessionBatchGetRequest): Promise<SessionBatchGetResponse> {
         this.require(SESSION_BATCH_GET_METHOD);
-        if (sessionIds.length === 0) return {sessions: [], missing: [], errors: []};
+        if (sessionIds.length === 0) return {sessions: []};
         await this.host.ensureAppServer();
         const client = this.host.client();
-        const {entries, missing, errors} = await this.host.runWithProcessCheck(() => readSessionBatchMetadata(
+        const entries = await this.host.runWithProcessCheck(() => readSessionBatchMetadata(
             client.appServerClient, client.getHomePath(), sessionIds,
         ));
-        return {sessions: await this.rows(entries, true), missing, errors};
+        return {sessions: await this.rows(entries, true)};
     }
 
     /**

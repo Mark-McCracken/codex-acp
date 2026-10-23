@@ -100,8 +100,6 @@ export type SessionArchiveRequest = { sessionId: string };
 export type SessionBatchGetRequest = {sessionIds: string[]};
 export type SessionBatchGetResponse = {
     sessions: acp.SessionInfo[];
-    missing: string[];
-    errors: {sessionId: string; code: "unavailable"; message?: string}[];
 };
 
 export const sessionBatchGetParamsParser = z.strictObject({
